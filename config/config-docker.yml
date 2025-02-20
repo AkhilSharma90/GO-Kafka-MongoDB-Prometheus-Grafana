@@ -1,0 +1,56 @@
+AppVersion: 1.0.0
+
+Server:
+  Port: ":5000"
+  Development: true
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  MaxConnectionIdle: 5
+  MaxConnectionAge: 5
+
+Http:
+  Port: ":5007"
+  PprofPort: ":8100"
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  CookieLifeTime: 44640
+  SessionCookieName: "session_token"
+
+Kafka:
+  Brokers: ["host.docker.internal:9091", "host.docker.internal:9092", "host.docker.internal:9093"]
+  Brokers: ["kafka1:19091", "kafka2:19092", "kafka3:19093"]
+  
+Logger:
+  DisableCaller: false
+  DisableStacktrace: false
+  Encoding: json
+  Level: info
+
+Metrics:
+  Port: ":7070"
+  Url: "host.docker.internal:7071"
+  ServiceName: products_microservice
+
+Jaeger:
+  Host: "host.docker.internal:6831"
+  ServiceName: products_microservice
+  LogSpans: false
+
+MongoDB:
+  URI: "mongodb://host.docker.internal:27017"
+  User: "admin"
+  Password: "admin"
+  DB: "products"
+
+Redis:
+  RedisAddr: "host.docker.internal:6379"
+  RedisPassword: ""
+  RedisDb: 0
+  RedisDefaultDB: 0
+  MinIdleConn: 200
+  PoolSize: 12000
+  PoolTimeout: 240
+  Password: ""
+  DB: 0

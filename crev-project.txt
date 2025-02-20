@@ -1,0 +1,5876 @@
+Project Directory Structure:
+├── Dockerfile
+├── Dockerfile.dev
+├── Makefile
+├── cmd
+│   └── main.go
+├── config
+│   ├── config-docker.yml
+│   ├── config.go
+│   └── config.yaml
+├── docker-compose.local.yml
+├── docker-compose.yml
+├── docs
+│   ├── docs.go
+│   ├── swagger.json
+│   └── swagger.yaml
+├── internal
+│   ├── interceptors
+│   │   └── manager.go
+│   ├── middlewares
+│   │   └── manager.go
+│   ├── models
+│   │   ├── message.go
+│   │   └── product.go
+│   ├── product
+│   │   ├── delivery
+│   │   ├── delivery.go
+│   │   │   ├── grpc
+│   │   │   │   ├── grpc_metrics.go
+│   │   │   │   └── product_service.go
+│   │   │   ├── http
+│   │   │   │   ├── v1
+│   │   │   │   │   ├── handlers.go
+│   │   │   │   │   ├── http_metrics.go
+│   │   │   │   │   └── routes.go
+│   │   │   ├── kafka
+│   │   │   │   ├── constants.go
+│   │   │   │   ├── consumer_group.go
+│   │   │   │   ├── producer.go
+│   │   │   │   └── workers.go
+│   │   ├── repository
+│   │   ├── repository.go
+│   │   │   ├── mongo_repository.go
+│   │   │   └── redis_repository.go
+│   │   ├── usecase
+│   │   ├── usecase.go
+│   │   │   └── usecase.go
+│   ├── server
+│   │   ├── http.go
+│   │   └── server.go
+├── monitoring
+│   ├── prometheus-local.yml
+│   └── prometheus.yml
+├── pkg
+│   ├── grpc_errors
+│   │   └── grpc_errors.go
+│   ├── http_errors
+│   │   └── http_errors.go
+│   ├── jaeger
+│   │   └── jaeger.go
+│   ├── kafka
+│   │   └── kafka.go
+│   ├── logger
+│   │   └── logger.go
+│   ├── mongodb
+│   │   └── mongodb.go
+│   ├── product_errors
+│   │   └── product_errors.go
+│   ├── redis
+│   │   └── redis.go
+│   ├── utils
+│   │   └── pagination.go
+├── proto
+│   ├── product
+│   │   ├── product.pb.go
+│   │   └── product.proto
+├── scripts
+│   └── init.js
+├── ssl
+│   ├── ca.key
+│   ├── instructions.sh
+│   ├── server.key
+│   └── server.pem
+
+
+File: 
+Dockerfile
+Content: 
+FROM golang:1.16-alpine AS builder
+
+# Set necessary environmet variables needed for our image
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+# Move to working directory /build
+WORKDIR /build
+
+# Copy and download dependency using go mod
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
+
+# Copy the code into the container
+COPY . .
+
+# Build the application
+# go build -o [name] [path to file]
+RUN go build -o app cmd/main.go
+
+# Move to /dist directory as the place for resulting binary folder
+WORKDIR /dist
+
+# Copy binary from build to main folder
+RUN cp /build/app .
+
+############################
+# STEP 2 build a small image
+############################
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+
+COPY . .
+COPY --from=builder /dist/app /
+#COPY ./database/data.json /database/data.json
+# Copy the code into the container
+
+#EXPOSE 5555
+
+# Command to run the executable
+ENTRYPOINT ["/app"]
+
+File: 
+Dockerfile.dev
+Content: 
+FROM golang:latest
+
+RUN go install github.com/githubnemo/CompileDaemon@latest
+WORKDIR /app
+
+ENV CONFIG=docker
+
+COPY . /app
+
+#RUN go mod download
+
+EXPOSE 5000 40000
+
+ENTRYPOINT CompileDaemon --build="go build -o main cmd/main.go" --command=./main
+
+File: 
+Makefile
+Content: 
+.PHONY:
+
+# ==============================================================================
+# Docker
+
+develop:
+	echo "Starting develop docker compose"
+	docker-compose -f docker-compose.yml up --build -d
+
+local:
+	echo "Starting local docker compose"
+	docker-compose -f docker-compose.local.yml up --build
+
+
+upload:
+	docker build -t alexanderbryksin/products_microservice:latest -f ./Dockerfile .
+	docker push alexanderbryksin/products_microservice:latest
+	#APP_VERSION=latest docker-compose up
+
+pull:
+	sudo docker pull alexanderbryksin/products_microservice:latest
+
+
+crate_topics:
+	docker exec -it kafka1 kafka-topics --zookeeper zookeeper:2181 --create --topic create-product --partitions 3 --replication-factor 2
+	docker exec -it kafka1 kafka-topics --zookeeper zookeeper:2181 --create --topic update-product --partitions 3 --replication-factor 2
+	docker exec -it kafka1 kafka-topics --zookeeper zookeeper:2181 --create --topic dead-letter-queue --partitions 3 --replication-factor 2
+
+
+# ==============================================================================
+# Modules support
+
+deps-reset:
+	git checkout -- go.mod
+	go mod tidy
+	go mod vendor
+
+tidy:
+	go mod tidy
+	go mod vendor
+
+deps-upgrade:
+	# go get $(go list -f '{{if not (or .Main .Indirect)}}{{.Path}}{{end}}' -m all)
+	go get -u -t -d -v ./...
+	go mod tidy
+	go mod vendor
+
+deps-cleancache:
+	go clean -modcache
+
+# ==============================================================================
+# Linters
+
+run-linter:
+	echo "Starting linters"
+	golangci-lint run ./...
+
+
+# ==============================================================================
+# Docker support
+
+FILES := $(shell docker ps -aq)
+
+down-local:
+	docker stop $(FILES)
+	docker rm $(FILES)
+
+clean:
+	docker system prune -f
+
+logs-local:
+	docker logs -f $(FILES)
+
+
+# ==============================================================================
+# Make local SSL Certificate
+
+cert:
+	echo "Generating SSL certificates"
+	cd ./ssl && sh instructions.sh
+
+
+# ==============================================================================
+# Swagger
+
+swagger:
+	echo "Starting swagger generating"
+	swag init -g **/**/*.go
+
+# ==============================================================================
+# MongoDB
+
+mongo:
+	cd ./scripts && mongo admin -u admin -p admin < init.js
+
+File: 
+cmd\main.go
+Content: 
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/opentracing/opentracing-go"
+
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/internal/server"
+	"github.com/AleksK1NG/products-microservice/pkg/jaeger"
+	"github.com/AleksK1NG/products-microservice/pkg/kafka"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+	"github.com/AleksK1NG/products-microservice/pkg/mongodb"
+	"github.com/AleksK1NG/products-microservice/pkg/redis"
+)
+
+// @title Products microservice
+// @version 1.0
+// @description Products REST API
+// @termsOfService http://swagger.io/terms/
+
+// @contact.name Alexander Bryksin
+// @contact.url https://github.com/AleksK1NG
+// @contact.email alexander.bryksin@yandex.ru
+
+// @license.name Apache 2.0
+// @license.url http://www.apache.org/licenses/LICENSE-2.0.html
+
+// @host localhost:5007
+// @BasePath /api/v1
+
+func main() {
+	log.Println("Starting products microservice")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg, err := config.ParseConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	appLogger := logger.NewApiLogger(cfg)
+	appLogger.InitLogger()
+	appLogger.Info("Starting user server")
+	appLogger.Infof(
+		"AppVersion: %s, LogLevel: %s, DevelopmentMode: %s",
+		cfg.AppVersion,
+		cfg.Logger.Level,
+		cfg.Server.Development,
+	)
+	appLogger.Infof("Success parsed config: %#v", cfg.AppVersion)
+
+	tracer, closer, err := jaeger.InitJaeger(cfg)
+	if err != nil {
+		appLogger.Fatal("cannot create tracer", err)
+	}
+	appLogger.Info("Jaeger connected")
+
+	opentracing.SetGlobalTracer(tracer)
+	defer closer.Close()
+	appLogger.Info("Opentracing connected")
+
+	mongoDBConn, err := mongodb.NewMongoDBConn(ctx, cfg)
+	if err != nil {
+		appLogger.Fatal("cannot connect mongodb", err)
+	}
+	defer func() {
+		if err := mongoDBConn.Disconnect(ctx); err != nil {
+			appLogger.Fatal("mongoDBConn.Disconnect", err)
+		}
+	}()
+	appLogger.Infof("MongoDB connected: %v", mongoDBConn.NumberSessionsInProgress())
+
+	conn, err := kafka.NewKafkaConn(cfg)
+	if err != nil {
+		appLogger.Fatal("NewKafkaConn", err)
+	}
+	defer conn.Close()
+	brokers, err := conn.Brokers()
+	if err != nil {
+		appLogger.Fatal("conn.Brokers", err)
+	}
+	appLogger.Infof("Kafka connected: %v", brokers)
+
+	redisClient := redis.NewRedisClient(cfg)
+	appLogger.Info("Redis connected")
+
+	s := server.NewServer(appLogger, cfg, tracer, mongoDBConn, redisClient)
+	appLogger.Fatal(s.Run())
+}
+
+
+File: 
+config\config-docker.yml
+Content: 
+AppVersion: 1.0.0
+
+Server:
+  Port: ":5000"
+  Development: true
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  MaxConnectionIdle: 5
+  MaxConnectionAge: 5
+
+Http:
+  Port: ":5007"
+  PprofPort: ":8100"
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  CookieLifeTime: 44640
+  SessionCookieName: "session_token"
+
+Kafka:
+  Brokers: ["host.docker.internal:9091", "host.docker.internal:9092", "host.docker.internal:9093"]
+  Brokers: ["kafka1:19091", "kafka2:19092", "kafka3:19093"]
+  
+Logger:
+  DisableCaller: false
+  DisableStacktrace: false
+  Encoding: json
+  Level: info
+
+Metrics:
+  Port: ":7070"
+  Url: "host.docker.internal:7071"
+  ServiceName: products_microservice
+
+Jaeger:
+  Host: "host.docker.internal:6831"
+  ServiceName: products_microservice
+  LogSpans: false
+
+MongoDB:
+  URI: "mongodb://host.docker.internal:27017"
+  User: "admin"
+  Password: "admin"
+  DB: "products"
+
+Redis:
+  RedisAddr: "host.docker.internal:6379"
+  RedisPassword: ""
+  RedisDb: 0
+  RedisDefaultDB: 0
+  MinIdleConn: 200
+  PoolSize: 12000
+  PoolTimeout: 240
+  Password: ""
+  DB: 0
+
+
+File: 
+config\config.go
+Content: 
+package config
+
+import (
+	"log"
+	"os"
+	"time"
+
+	"github.com/spf13/viper"
+)
+
+const (
+	GRPC_PORT = "GRPC_PORT"
+	HTTP_PORT = "HTTP_PORT"
+)
+
+// Config of application
+type Config struct {
+	AppVersion string
+	Server     Server
+	Logger     Logger
+	Jaeger     Jaeger
+	Metrics    Metrics
+	MongoDB    MongoDB
+	Kafka      Kafka
+	Http       Http
+	Redis      Redis
+}
+
+// Server config
+type Server struct {
+	Port              string
+	Development       bool
+	Timeout           time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	MaxConnectionIdle time.Duration
+	MaxConnectionAge  time.Duration
+	Kafka             Kafka
+}
+
+type Http struct {
+	Port              string
+	PprofPort         string
+	Timeout           time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	CookieLifeTime    int
+	SessionCookieName string
+}
+
+// Logger config
+type Logger struct {
+	DisableCaller     bool
+	DisableStacktrace bool
+	Encoding          string
+	Level             string
+}
+
+// Metrics config
+type Metrics struct {
+	Port        string
+	URL         string
+	ServiceName string
+}
+
+// Jaeger config
+type Jaeger struct {
+	Host        string
+	ServiceName string
+	LogSpans    bool
+}
+
+type MongoDB struct {
+	URI      string
+	User     string
+	Password string
+	DB       string
+}
+
+type Kafka struct {
+	Brokers []string
+}
+
+type Redis struct {
+	RedisAddr      string
+	RedisPassword  string
+	RedisDB        string
+	RedisDefaultDB string
+	MinIdleConn    int
+	PoolSize       int
+	PoolTimeout    int
+	Password       string
+	DB             int
+}
+
+func exportConfig() error {
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath("./config")
+	if os.Getenv("MODE") == "DOCKER" {
+		viper.SetConfigName("config-docker.yml")
+	} else {
+		viper.SetConfigName("config.yaml")
+	}
+
+	if err := viper.ReadInConfig(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ParseConfig Parse config file
+func ParseConfig() (*Config, error) {
+	if err := exportConfig(); err != nil {
+		return nil, err
+	}
+
+	var c Config
+	err := viper.Unmarshal(&c)
+	if err != nil {
+		log.Printf("unable to decode into struct, %v", err)
+		return nil, err
+	}
+
+	gRPCPort := os.Getenv(GRPC_PORT)
+	if gRPCPort != "" {
+		c.Server.Port = gRPCPort
+	}
+
+	httpPort := os.Getenv(HTTP_PORT)
+	if httpPort != "" {
+		c.Http.Port = httpPort
+	}
+
+	return &c, nil
+}
+
+
+File: 
+config\config.yaml
+Content: 
+AppVersion: 1.0.0
+
+Server:
+  Port: :5555
+  Development: true
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  MaxConnectionIdle: 5
+  MaxConnectionAge: 5
+
+
+Http:
+  Port: ":5007"
+  PprofPort: ":8100"
+  Timeout: 15
+  ReadTimeout: 5
+  WriteTimeout: 5
+  CookieLifeTime: 44640
+  SessionCookieName: "session_token"
+
+
+Kafka:
+  Brokers: [ "localhost:9091",  "localhost:9092",  "localhost:9093" ]
+
+Logger:
+  DisableCaller: false
+  DisableStacktrace: false
+  Encoding: json
+  Level: info
+
+Metrics:
+  Port: ":7070"
+  Url: 0.0.0.0:7071
+  ServiceName: products_microservice
+
+Jaeger:
+  Host: localhost:6831
+  ServiceName: products_microservice
+  LogSpans: false
+
+MongoDB:
+  URI: "mongodb://localhost:27017"
+  User: "admin"
+  Password: "admin"
+  DB: "products"
+
+Redis:
+  RedisAddr: localhost:6379
+  RedisPassword:
+  RedisDb: 0
+  RedisDefaultDB: 0
+  MinIdleConn: 200
+  PoolSize: 12000
+  PoolTimeout: 240
+  Password: ""
+  DB: 0
+
+File: 
+docker-compose.local.yml
+Content: 
+version: "3.8"
+
+services:
+  zookeeper:
+    container_name: zookeeper
+    restart: always
+    image: zookeeper:3.4.9
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_PORT: 2181
+      ZOO_SERVERS: server.1=zookeeper:2888:3888
+    volumes:
+      - ./data/zookeeper/data:/data
+      - ./data/zookeeper/datalog:/datalog
+    networks:
+      - products_network
+
+
+  kafka1:
+    container_name: kafka1
+    image: confluentinc/cp-kafka:5.3.0
+    restart: always
+    hostname: kafka1
+    ports:
+      - "9091:9091"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka1:19091,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9091
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./data/kafka1/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafka2:
+    container_name: kafka2
+    restart: always
+    image: confluentinc/cp-kafka:5.3.0
+    hostname: kafka2
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka2:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 2
+    volumes:
+      - ./data/kafka2/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafka3:
+    container_name: kafka3
+    image: confluentinc/cp-kafka:5.3.0
+    restart: always
+    hostname: kafka3
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka3:19093,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./data/kafka3/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafdrop:
+    container_name: kafdrop
+    image: obsidiandynamics/kafdrop
+    restart: "no"
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: "kafka1:19091"
+    depends_on:
+      - kafka1
+      - kafka2
+      - kafka3
+    networks:
+      - products_network
+
+  redis:
+    image: redis:6-alpine
+    container_name: user_redis
+    ports:
+      - "6379:6379"
+    restart: always
+    networks:
+      - products_network
+
+  prometheus:
+    container_name: prometheus_container
+    restart: always
+    image: prom/prometheus
+    volumes:
+      - ./monitoring/prometheus-local.yml:/etc/prometheus/prometheus.yml:Z
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - '9090:9090'
+    networks:
+      - products_network
+
+
+  node_exporter:
+    container_name: node_exporter_container
+    restart: always
+    image: prom/node-exporter
+    ports:
+      - '9101:9100'
+    networks:
+      - products_network
+
+  grafana:
+    container_name: grafana_container
+    restart: always
+    image: grafana/grafana
+    ports:
+      - '3000:3000'
+    networks:
+      - products_network
+
+  jaeger:
+    container_name: jaeger_container
+    restart: always
+    image: jaegertracing/all-in-one:1.21
+    environment:
+      - COLLECTOR_ZIPKIN_HTTP_PORT=9411
+    ports:
+      - 5775:5775/udp
+      - 6831:6831/udp
+      - 6832:6832/udp
+      - 5778:5778
+      - 16686:16686
+      - 14268:14268
+      - 14250:14250
+      - 9411:9411
+    networks:
+      - products_network
+
+  mongodb:
+    image: mongo:latest
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGODB_DATABASE: products
+    ports:
+      - 27017:27017
+    volumes:
+      - mongodb_data_container:/data/db
+
+volumes:
+  mongodb_data_container:
+#volumes:
+#  main_pgdata:
+#  user_pgdata:
+#  prometheus-data:
+
+networks:
+  products_network:
+    driver: bridge
+
+File: 
+docker-compose.yml
+Content: 
+version: "3.8"
+
+services:
+  app:
+    container_name: microservice
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+    - ./:/app
+    ports:
+      - 5000:5000
+      - 5007:5007
+      - 7070:7070
+    environment:
+      - GRPC_PORT=:5000
+      - HTTP_PORT=:5007
+      - MODE=DOCKER
+    restart: always
+    depends_on:
+      - redis
+      - prometheus
+      - grafana
+      - jaeger
+      - node_exporter
+      - mongodb
+      - kafdrop
+      - kafka1
+      - kafka2
+      - kafka3
+      - zookeeper
+    networks:
+      - products_network
+
+  zookeeper:
+    container_name: zookeeper
+    restart: always
+    image: zookeeper:3.4.9
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_PORT: 2181
+      ZOO_SERVERS: server.1=zookeeper:2888:3888
+    volumes:
+      - ./data/zookeeper/data:/data
+      - ./data/zookeeper/datalog:/datalog
+    networks:
+      - products_network
+
+
+  kafka1:
+    container_name: kafka1
+    restart: always
+    image: confluentinc/cp-kafka:5.3.0
+    hostname: kafka1
+    ports:
+      - "9091:9091"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka1:19091,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-host.docker.internal}:9091
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./data/kafka1/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafka2:
+    container_name: kafka2
+    restart: always
+    image: confluentinc/cp-kafka:5.3.0
+    hostname: kafka2
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka2:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-host.docker.internal}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 2
+    volumes:
+      - ./data/kafka2/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafka3:
+    container_name: kafka3
+    restart: always
+    image: confluentinc/cp-kafka:5.3.0
+    hostname: kafka3
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka3:19093,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-host.docker.internal}:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - ./data/kafka3/data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - products_network
+
+  kafdrop:
+    container_name: kafdrop
+    restart: always
+    image: obsidiandynamics/kafdrop
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: "kafka1:19091"
+    depends_on:
+      - kafka1
+      - kafka2
+      - kafka3
+    networks:
+      - products_network
+
+  redis:
+    image: redis:6-alpine
+    restart: always
+    container_name: user_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - products_network
+
+  prometheus:
+    container_name: prometheus_container
+    restart: always
+    image: prom/prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:Z
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - '9090:9090'
+    networks:
+      - products_network
+
+
+  node_exporter:
+    container_name: node_exporter_container
+    restart: always
+    image: prom/node-exporter
+    ports:
+      - '9101:9100'
+    networks:
+      - products_network
+
+  grafana:
+    container_name: grafana_container
+    restart: always
+    image: grafana/grafana
+    ports:
+      - '3000:3000'
+    networks:
+      - products_network
+
+  jaeger:
+    container_name: jaeger_container
+    restart: always
+    image: jaegertracing/all-in-one:1.21
+    environment:
+      - COLLECTOR_ZIPKIN_HTTP_PORT=9411
+    ports:
+      - 5775:5775/udp
+      - 6831:6831/udp
+      - 6832:6832/udp
+      - 5778:5778
+      - 16686:16686
+      - 14268:14268
+      - 14250:14250
+      - 9411:9411
+    networks:
+      - products_network
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb_container
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGODB_DATABASE: products
+    ports:
+      - 27017:27017
+    volumes:
+      - mongodb_data_container:/data/db
+    networks:
+      - products_network
+
+volumes:
+  mongodb_data_container:
+
+networks:
+  products_network:
+    driver: bridge
+
+
+
+File: 
+docs\docs.go
+Content: 
+// GENERATED BY THE COMMAND ABOVE; DO NOT EDIT
+// This file was generated by swaggo/swag
+
+package docs
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"github.com/alecthomas/template"
+	"github.com/swaggo/swag"
+)
+
+var doc = `{
+    "schemes": {{ marshal .Schemes }},
+    "swagger": "2.0",
+    "info": {
+        "description": "{{.Description}}",
+        "title": "{{.Title}}",
+        "contact": {},
+        "version": "{{.Version}}"
+    },
+    "host": "{{.Host}}",
+    "basePath": "{{.BasePath}}",
+    "paths": {
+        "/products": {
+            "post": {
+                "description": "Create new single product",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Create new product",
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/search": {
+            "get": {
+                "description": "Search product by name or description",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Search product",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "search text",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "page number",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "number of elements",
+                        "name": "size",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.ProductsList"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/{product_id}": {
+            "get": {
+                "description": "Get single product by id",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Get product by id",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "product id",
+                        "name": "product_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Update single product by id",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Update single product",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "product id",
+                        "name": "product_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "models.Product": {
+            "type": "object",
+            "required": [
+                "description",
+                "name",
+                "price",
+                "quantity",
+                "rating"
+            ],
+            "properties": {
+                "CategoryId": {
+                    "type": "string"
+                },
+                "createdAt": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "imageUrl": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "photos": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "price": {
+                    "type": "number"
+                },
+                "productId": {
+                    "type": "string"
+                },
+                "quantity": {
+                    "type": "integer"
+                },
+                "rating": {
+                    "type": "integer"
+                },
+                "updatedAt": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.ProductsList": {
+            "type": "object",
+            "properties": {
+                "hasMore": {
+                    "type": "boolean"
+                },
+                "page": {
+                    "type": "integer"
+                },
+                "products": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.Product"
+                    }
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "totalCount": {
+                    "type": "integer"
+                },
+                "totalPages": {
+                    "type": "integer"
+                }
+            }
+        }
+    }
+}`
+
+type swaggerInfo struct {
+	Version     string
+	Host        string
+	BasePath    string
+	Schemes     []string
+	Title       string
+	Description string
+}
+
+// SwaggerInfo holds exported Swagger Info so clients can modify it
+var SwaggerInfo = swaggerInfo{
+	Version:     "",
+	Host:        "",
+	BasePath:    "",
+	Schemes:     []string{},
+	Title:       "",
+	Description: "",
+}
+
+type s struct{}
+
+func (s *s) ReadDoc() string {
+	sInfo := SwaggerInfo
+	sInfo.Description = strings.Replace(sInfo.Description, "\n", "\\n", -1)
+
+	t, err := template.New("swagger_info").Funcs(template.FuncMap{
+		"marshal": func(v interface{}) string {
+			a, _ := json.Marshal(v)
+			return string(a)
+		},
+	}).Parse(doc)
+	if err != nil {
+		return doc
+	}
+
+	var tpl bytes.Buffer
+	if err := t.Execute(&tpl, sInfo); err != nil {
+		return doc
+	}
+
+	return tpl.String()
+}
+
+func init() {
+	swag.Register(swag.Name, &s{})
+}
+
+
+File: 
+docs\swagger.json
+Content: 
+{
+    "swagger": "2.0",
+    "info": {
+        "contact": {}
+    },
+    "paths": {
+        "/products": {
+            "post": {
+                "description": "Create new single product",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Create new product",
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/search": {
+            "get": {
+                "description": "Search product by name or description",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Search product",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "search text",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "page number",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "number of elements",
+                        "name": "size",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.ProductsList"
+                        }
+                    }
+                }
+            }
+        },
+        "/products/{product_id}": {
+            "get": {
+                "description": "Get single product by id",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Get product by id",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "product id",
+                        "name": "product_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Update single product by id",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Products"
+                ],
+                "summary": "Update single product",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "product id",
+                        "name": "product_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.Product"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "models.Product": {
+            "type": "object",
+            "required": [
+                "description",
+                "name",
+                "price",
+                "quantity",
+                "rating"
+            ],
+            "properties": {
+                "CategoryId": {
+                    "type": "string"
+                },
+                "createdAt": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "imageUrl": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "photos": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "price": {
+                    "type": "number"
+                },
+                "productId": {
+                    "type": "string"
+                },
+                "quantity": {
+                    "type": "integer"
+                },
+                "rating": {
+                    "type": "integer"
+                },
+                "updatedAt": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.ProductsList": {
+            "type": "object",
+            "properties": {
+                "hasMore": {
+                    "type": "boolean"
+                },
+                "page": {
+                    "type": "integer"
+                },
+                "products": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.Product"
+                    }
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "totalCount": {
+                    "type": "integer"
+                },
+                "totalPages": {
+                    "type": "integer"
+                }
+            }
+        }
+    }
+}
+
+File: 
+docs\swagger.yaml
+Content: 
+definitions:
+  models.Product:
+    properties:
+      CategoryId:
+        type: string
+      createdAt:
+        type: string
+      description:
+        type: string
+      imageUrl:
+        type: string
+      name:
+        type: string
+      photos:
+        items:
+          type: string
+        type: array
+      price:
+        type: number
+      productId:
+        type: string
+      quantity:
+        type: integer
+      rating:
+        type: integer
+      updatedAt:
+        type: string
+    required:
+    - description
+    - name
+    - price
+    - quantity
+    - rating
+    type: object
+  models.ProductsList:
+    properties:
+      hasMore:
+        type: boolean
+      page:
+        type: integer
+      products:
+        items:
+          $ref: '#/definitions/models.Product'
+        type: array
+      size:
+        type: integer
+      totalCount:
+        type: integer
+      totalPages:
+        type: integer
+    type: object
+info:
+  contact: {}
+paths:
+  /products:
+    post:
+      consumes:
+      - application/json
+      description: Create new single product
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/models.Product'
+      summary: Create new product
+      tags:
+      - Products
+  /products/{product_id}:
+    get:
+      consumes:
+      - application/json
+      description: Get single product by id
+      parameters:
+      - description: product id
+        in: path
+        name: product_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.Product'
+      summary: Get product by id
+      tags:
+      - Products
+    put:
+      consumes:
+      - application/json
+      description: Update single product by id
+      parameters:
+      - description: product id
+        in: path
+        name: product_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.Product'
+      summary: Update single product
+      tags:
+      - Products
+  /products/search:
+    get:
+      consumes:
+      - application/json
+      description: Search product by name or description
+      parameters:
+      - description: search text
+        in: query
+        name: search
+        type: string
+      - description: page number
+        in: query
+        name: page
+        type: string
+      - description: number of elements
+        in: query
+        name: size
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.ProductsList'
+      summary: Search product
+      tags:
+      - Products
+swagger: "2.0"
+
+
+File: 
+internal\interceptors\manager.go
+Content: 
+package interceptors
+
+import (
+	"context"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+)
+
+var (
+	totalRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_service_requests_total",
+		Help: "The total number of incoming gRPC messages",
+	})
+)
+
+// InterceptorManager struct
+type InterceptorManager struct {
+	logger logger.Logger
+	cfg    *config.Config
+}
+
+// NewInterceptorManager InterceptorManager constructor
+func NewInterceptorManager(logger logger.Logger, cfg *config.Config) *InterceptorManager {
+	return &InterceptorManager{logger: logger, cfg: cfg}
+}
+
+// Logger Interceptor
+func (im *InterceptorManager) Logger(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (resp interface{}, err error) {
+	totalRequests.Inc()
+	start := time.Now()
+	md, _ := metadata.FromIncomingContext(ctx)
+	reply, err := handler(ctx, req)
+	im.logger.Infof("Method: %s, Time: %v, Metadata: %v, Err: %v", info.FullMethod, time.Since(start), md, err)
+
+	return reply, err
+}
+
+
+File: 
+internal\middlewares\manager.go
+Content: 
+package middlewares
+
+import (
+	"github.com/labstack/echo/v4"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+)
+
+var (
+	httpTotalRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_microservice_total_requests",
+		Help: "The total number of incoming HTTP requests",
+	})
+)
+
+// MiddlewareManager http middlewares
+type middlewareManager struct {
+	log logger.Logger
+	cfg *config.Config
+}
+
+// MiddlewareManager interface
+type MiddlewareManager interface {
+	Metrics(next echo.HandlerFunc) echo.HandlerFunc
+}
+
+// NewMiddlewareManager constructor
+func NewMiddlewareManager(log logger.Logger, cfg *config.Config) *middlewareManager {
+	return &middlewareManager{log: log, cfg: cfg}
+}
+
+// Metrics prometheus metrics
+func (m *middlewareManager) Metrics(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		httpTotalRequests.Inc()
+		return next(c)
+	}
+}
+
+
+File: 
+internal\models\message.go
+Content: 
+package models
+
+import "time"
+
+// ErrorMessage
+type ErrorMessage struct {
+	MessageID string    `json:"messageId"`
+	Offset    int64     `json:"offset"`
+	Partition int       `json:"partition"`
+	Topic     string    `json:"topic"`
+	Error     string    `json:"error"`
+	Time      time.Time `json:"time"`
+}
+
+
+File: 
+internal\models\product.go
+Content: 
+package models
+
+import (
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	productsService "github.com/AleksK1NG/products-microservice/proto/product"
+)
+
+// Product models
+type Product struct {
+	ProductID   primitive.ObjectID `json:"productId" bson:"_id,omitempty"`
+	CategoryID  primitive.ObjectID `json:"categoryId,omitempty" bson:"categoryId,omitempty"`
+	Name        string             `json:"name,omitempty" bson:"name,omitempty" validate:"required,min=3,max=250"`
+	Description string             `json:"description,omitempty" bson:"description,omitempty" validate:"required,min=3,max=500"`
+	Price       float64            `json:"price,omitempty" bson:"price,omitempty" validate:"required"`
+	ImageURL    *string            `json:"imageUrl,omitempty" bson:"imageUrl,omitempty"`
+	Photos      []string           `json:"photos,omitempty" bson:"photos,omitempty"`
+	Quantity    int64              `json:"quantity,omitempty" bson:"quantity,omitempty" validate:"required"`
+	Rating      int                `json:"rating,omitempty" bson:"rating,omitempty" validate:"required,min=0,max=10"`
+	CreatedAt   time.Time          `json:"createdAt" bson:"createdAt,omitempty"`
+	UpdatedAt   time.Time          `json:"updatedAt" bson:"updatedAt,omitempty"`
+}
+
+func (p *Product) GetImage() string {
+	var img string
+	if p.ImageURL != nil {
+		img = *p.ImageURL
+	}
+	return img
+}
+
+// ToProto Convert product to proto
+func (p *Product) ToProto() *productsService.Product {
+	return &productsService.Product{
+		ProductID:   p.ProductID.String(),
+		CategoryID:  p.CategoryID.String(),
+		Name:        p.Name,
+		Description: p.Description,
+		Price:       p.Price,
+		ImageURL:    p.GetImage(),
+		Photos:      p.Photos,
+		Quantity:    p.Quantity,
+		Rating:      int64(p.Rating),
+		CreatedAt:   timestamppb.New(p.CreatedAt),
+		UpdatedAt:   timestamppb.New(p.UpdatedAt),
+	}
+}
+
+// ProductFromProto Get Product from proto
+func ProductFromProto(product *productsService.Product) (*Product, error) {
+	prodID, err := primitive.ObjectIDFromHex(product.GetCategoryID())
+	if err != nil {
+		return nil, err
+	}
+	catID, err := primitive.ObjectIDFromHex(product.GetCategoryID())
+	if err != nil {
+		return nil, err
+	}
+
+	return &Product{
+		ProductID:   prodID,
+		CategoryID:  catID,
+		Name:        product.GetName(),
+		Description: product.GetDescription(),
+		Price:       product.GetPrice(),
+		ImageURL:    &product.ImageURL,
+		Photos:      product.GetPhotos(),
+		Quantity:    product.GetQuantity(),
+		Rating:      int(product.GetRating()),
+		CreatedAt:   product.GetCreatedAt().AsTime(),
+		UpdatedAt:   product.GetUpdatedAt().AsTime(),
+	}, nil
+}
+
+// ProductsList All Products response with pagination
+type ProductsList struct {
+	TotalCount int64      `json:"totalCount"`
+	TotalPages int64      `json:"totalPages"`
+	Page       int64      `json:"page"`
+	Size       int64      `json:"size"`
+	HasMore    bool       `json:"hasMore"`
+	Products   []*Product `json:"products"`
+}
+
+// ToProtoList convert products list to proto
+func (p *ProductsList) ToProtoList() []*productsService.Product {
+	productsList := make([]*productsService.Product, 0, len(p.Products))
+	for _, product := range p.Products {
+		productsList = append(productsList, product.ToProto())
+	}
+	return productsList
+}
+
+
+File: 
+internal\product\delivery.go
+Content: 
+package product
+
+import "github.com/labstack/echo/v4"
+
+// HttpDelivery http delivery
+type HttpDelivery interface {
+	CreateProduct() echo.HandlerFunc
+	UpdateProduct() echo.HandlerFunc
+	GetByIDProduct() echo.HandlerFunc
+	SearchProduct() echo.HandlerFunc
+}
+
+
+File: 
+internal\product\delivery\grpc\grpc_metrics.go
+Content: 
+package grpc
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	successMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_success_incoming_grpc_messages_total",
+		Help: "The total number of success incoming success gRPC messages",
+	})
+	errorMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_error_incoming_grpc_message_total",
+		Help: "The total number of error incoming success gRPC messages",
+	})
+	createMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_create_incoming_grpc_requests_total",
+		Help: "The total number of incoming create product gRPC messages",
+	})
+	updateMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_update_incoming_grpc_requests_total",
+		Help: "The total number of incoming update product gRPC messages",
+	})
+	getByIdMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_get_by_id_incoming_grpc_requests_total",
+		Help: "The total number of incoming get by id product gRPC messages",
+	})
+	searchMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_search_incoming_grpc_requests_total",
+		Help: "The total number of incoming search products gRPC messages",
+	})
+)
+
+
+File: 
+internal\product\delivery\grpc\product_service.go
+Content: 
+package grpc
+
+import (
+	"context"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/opentracing/opentracing-go"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/internal/product"
+	grpcErrors "github.com/AleksK1NG/products-microservice/pkg/grpc_errors"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+	"github.com/AleksK1NG/products-microservice/proto/product"
+)
+
+// productService gRPC Service
+type productService struct {
+	log       logger.Logger
+	productUC product.UseCase
+	validate  *validator.Validate
+}
+
+// NewProductService productService constructor
+func NewProductService(log logger.Logger, productUC product.UseCase, validate *validator.Validate) *productService {
+	return &productService{log: log, productUC: productUC, validate: validate}
+}
+
+// Create create new product
+func (p *productService) Create(ctx context.Context, req *productsService.CreateReq) (*productsService.CreateRes, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productService.Create")
+	defer span.Finish()
+	createMessages.Inc()
+
+	catID, err := primitive.ObjectIDFromHex(req.GetCategoryID())
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	prod := &models.Product{
+		CategoryID:  catID,
+		Name:        req.GetName(),
+		Description: req.GetDescription(),
+		Price:       req.GetPrice(),
+		ImageURL:    &req.ImageURL,
+		Photos:      req.GetPhotos(),
+		Quantity:    req.GetQuantity(),
+		Rating:      int(req.GetRating()),
+	}
+
+	created, err := p.productUC.Create(ctx, prod)
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("productUC.Create: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	successMessages.Inc()
+	return &productsService.CreateRes{Product: created.ToProto()}, nil
+}
+
+// Update Update existing product
+func (p *productService) Update(ctx context.Context, req *productsService.UpdateReq) (*productsService.UpdateRes, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productService.Update")
+	defer span.Finish()
+	updateMessages.Inc()
+
+	prodID, err := primitive.ObjectIDFromHex(req.GetProductID())
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+	catID, err := primitive.ObjectIDFromHex(req.GetCategoryID())
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	prod := &models.Product{
+		ProductID:   prodID,
+		CategoryID:  catID,
+		Name:        req.GetName(),
+		Description: req.GetDescription(),
+		Price:       req.GetPrice(),
+		ImageURL:    &req.ImageURL,
+		Photos:      req.GetPhotos(),
+		Quantity:    req.GetQuantity(),
+		Rating:      int(req.GetRating()),
+	}
+
+	update, err := p.productUC.Update(ctx, prod)
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("productUC.Update: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	successMessages.Inc()
+	return &productsService.UpdateRes{Product: update.ToProto()}, nil
+}
+
+// GetByID Get single product by id
+func (p *productService) GetByID(ctx context.Context, req *productsService.GetByIDReq) (*productsService.GetByIDRes, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productService.GetByID")
+	defer span.Finish()
+	getByIdMessages.Inc()
+
+	prodID, err := primitive.ObjectIDFromHex(req.GetProductID())
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	prod, err := p.productUC.GetByID(ctx, prodID)
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("productUC.GetByID: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	successMessages.Inc()
+	return &productsService.GetByIDRes{Product: prod.ToProto()}, nil
+}
+
+// Search Search products
+func (p *productService) Search(ctx context.Context, req *productsService.SearchReq) (*productsService.SearchRes, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productService.Search")
+	defer span.Finish()
+	searchMessages.Inc()
+
+	products, err := p.productUC.Search(ctx, req.GetSearch(), utils.NewPaginationQuery(int(req.GetSize()), int(req.GetPage())))
+	if err != nil {
+		errorMessages.Inc()
+		p.log.Errorf("productUC.Search: %v", err)
+		return nil, grpcErrors.ErrorResponse(err, err.Error())
+	}
+
+	successMessages.Inc()
+	return &productsService.SearchRes{
+		TotalCount: products.TotalCount,
+		TotalPages: products.TotalPages,
+		Page:       products.Page,
+		Size:       products.Size,
+		HasMore:    products.HasMore,
+		Products:   products.ToProtoList(),
+	}, nil
+}
+
+
+File: 
+internal\product\delivery\http\v1\handlers.go
+Content: 
+package v1
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/labstack/echo/v4"
+	"github.com/opentracing/opentracing-go"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/middlewares"
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/internal/product"
+	httpErrors "github.com/AleksK1NG/products-microservice/pkg/http_errors"
+
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+)
+
+type productHandlers struct {
+	log       logger.Logger
+	productUC product.UseCase
+	validate  *validator.Validate
+	group     *echo.Group
+	mw        middlewares.MiddlewareManager
+}
+
+// NewProductHandlers constructor
+func NewProductHandlers(
+	log logger.Logger,
+	productUC product.UseCase,
+	validate *validator.Validate,
+	group *echo.Group,
+	mw middlewares.MiddlewareManager,
+) *productHandlers {
+	return &productHandlers{log: log, productUC: productUC, validate: validate, group: group, mw: mw}
+}
+
+// CreateProduct Create product
+// @Tags Products
+// @Summary Create new product
+// @Description Create new single product
+// @Accept json
+// @Produce json
+// @Success 201 {object} models.Product
+// @Router /products [post]
+func (p *productHandlers) CreateProduct() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		span, ctx := opentracing.StartSpanFromContext(c.Request().Context(), "productHandlers.Create")
+		defer span.Finish()
+		createRequests.Inc()
+
+		var prod models.Product
+		if err := c.Bind(&prod); err != nil {
+			p.log.Errorf("c.Bind: %v", err)
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		if err := p.validate.StructCtx(ctx, &prod); err != nil {
+			p.log.Errorf("validate.StructCtx: %v", err)
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		if err := p.productUC.PublishCreate(ctx, &prod); err != nil {
+			p.log.Errorf("productUC.PublishCreate: %v", err)
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		successRequests.Inc()
+		return c.NoContent(http.StatusCreated)
+	}
+}
+
+// UpdateProduct Update product
+// @Tags Products
+// @Summary Update single product
+// @Description Update single product by id
+// @Accept json
+// @Produce json
+// @Param product_id path string true "product id"
+// @Success 200 {object} models.Product
+// @Router /products/{product_id} [put]
+func (p *productHandlers) UpdateProduct() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		span, ctx := opentracing.StartSpanFromContext(c.Request().Context(), "productHandlers.Update")
+		defer span.Finish()
+		updateRequests.Inc()
+
+		var prod models.Product
+		if err := c.Bind(&prod); err != nil {
+			p.log.Errorf("c.Bind: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		prodID, err := primitive.ObjectIDFromHex(c.Param("product_id"))
+		if err != nil {
+			p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+		prod.ProductID = prodID
+
+		if err := p.validate.StructCtx(ctx, &prod); err != nil {
+			p.log.Errorf("validate.StructCtx: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		if err := p.productUC.PublishUpdate(ctx, &prod); err != nil {
+			p.log.Errorf("productUC.PublishUpdate: %v", err)
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		successRequests.Inc()
+		return c.NoContent(http.StatusOK)
+	}
+}
+
+// GetByIDProduct Get product by id
+// @Tags Products
+// @Summary Get product by id
+// @Description Get single product by id
+// @Accept json
+// @Produce json
+// @Param product_id path string true "product id"
+// @Success 200 {object} models.Product
+// @Router /products/{product_id} [get]
+func (p *productHandlers) GetByIDProduct() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		span, ctx := opentracing.StartSpanFromContext(c.Request().Context(), "productHandlers.GetByID")
+		defer span.Finish()
+		getByIdRequests.Inc()
+
+		objectID, err := primitive.ObjectIDFromHex(c.Param("product_id"))
+		if err != nil {
+			p.log.Errorf("primitive.ObjectIDFromHex: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		prod, err := p.productUC.GetByID(ctx, objectID)
+		if err != nil {
+			p.log.Errorf("productUC.GetByID: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		successRequests.Inc()
+		return c.JSON(http.StatusOK, prod)
+	}
+}
+
+// SearchProduct Search product
+// @Tags Products
+// @Summary Search product
+// @Description Search product by name or description
+// @Accept json
+// @Produce json
+// @Param search query string false "search text"
+// @Param page query string false "page number"
+// @Param size query string false "number of elements"
+// @Success 200 {object} models.ProductsList
+// @Router /products/search [get]
+func (p *productHandlers) SearchProduct() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		span, ctx := opentracing.StartSpanFromContext(c.Request().Context(), "productHandlers.Search")
+		defer span.Finish()
+		searchRequests.Inc()
+
+		page, err := strconv.Atoi(c.QueryParam("page"))
+		if err != nil {
+			p.log.Errorf("strconv.Atoi: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, httpErrors.BadRequest)
+		}
+		size, err := strconv.Atoi(c.QueryParam("size"))
+		if err != nil {
+			p.log.Errorf("strconv.Atoi: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, httpErrors.BadRequest)
+		}
+
+		pq := utils.NewPaginationQuery(size, page)
+		result, err := p.productUC.Search(ctx, c.QueryParam("search"), pq)
+		if err != nil {
+			p.log.Errorf("productUC.Search: %v", err)
+			errorRequests.Inc()
+			return httpErrors.ErrorCtxResponse(c, err)
+		}
+
+		successRequests.Inc()
+		return c.JSON(http.StatusOK, result)
+	}
+}
+
+
+File: 
+internal\product\delivery\http\v1\http_metrics.go
+Content: 
+package v1
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	successRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_success_incoming_messages_total",
+		Help: "The total number of success incoming success HTTP requests",
+	})
+	errorRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_error_incoming_message_total",
+		Help: "The total number of error incoming success HTTP requests",
+	})
+	createRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_create_incoming_requests_total",
+		Help: "The total number of incoming create product HTTP requests",
+	})
+	updateRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_update_incoming_requests_total",
+		Help: "The total number of incoming update product HTTP requests",
+	})
+	getByIdRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_get_by_id_incoming_requests_total",
+		Help: "The total number of incoming get by id product HTTP requests",
+	})
+	searchRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_products_search_incoming_requests_total",
+		Help: "The total number of incoming search products HTTP requests",
+	})
+)
+
+
+File: 
+internal\product\delivery\http\v1\routes.go
+Content: 
+package v1
+
+import (
+	"net/http"
+
+	"github.com/labstack/echo/v4"
+)
+
+// MapRoutes products routes
+func (p *productHandlers) MapRoutes() {
+
+	p.group.GET("/test", func(c echo.Context) error {
+		return c.String(http.StatusOK, "Hello from test endpoint!")
+	})
+	p.group.POST("", p.CreateProduct())
+	p.group.PUT("/:product_id", p.UpdateProduct())
+	p.group.GET("/:product_id", p.GetByIDProduct())
+	p.group.GET("/search", p.SearchProduct())
+}
+
+
+File: 
+internal\product\delivery\kafka\constants.go
+Content: 
+package kafka
+
+import (
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	incomingMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_incoming_kafka_messages_total",
+		Help: "The total number of incoming Kafka messages",
+	})
+	successMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_success_incoming_kafka_messages_total",
+		Help: "The total number of success incoming success Kafka messages",
+	})
+	errorMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "products_error_incoming_kafka_message_total",
+		Help: "The total number of error incoming success Kafka messages",
+	})
+)
+
+const (
+	minBytes               = 10e3 // 10KB
+	maxBytes               = 10e6 // 10MB
+	queueCapacity          = 100
+	heartbeatInterval      = 3 * time.Second
+	commitInterval         = 0
+	partitionWatchInterval = 5 * time.Second
+	maxAttempts            = 3
+	dialTimeout            = 3 * time.Minute
+
+	writerReadTimeout  = 10 * time.Second
+	writerWriteTimeout = 10 * time.Second
+	writerRequiredAcks = -1
+	writerMaxAttempts  = 3
+
+	createProductTopic   = "create-product"
+	createProductWorkers = 3
+	updateProductTopic   = "update-product"
+	updateProductWorkers = 3
+
+	deadLetterQueueTopic = "dead-letter-queue"
+
+	productsGroupID = "products_group"
+)
+
+
+File: 
+internal\product\delivery\kafka\consumer_group.go
+Content: 
+package kafka
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/compress"
+
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/internal/product"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+)
+
+// ProductsConsumerGroup struct
+type ProductsConsumerGroup struct {
+	Brokers    []string
+	GroupID    string
+	log        logger.Logger
+	cfg        *config.Config
+	productsUC product.UseCase
+	validate   *validator.Validate
+}
+
+// NewProductsConsumerGroup constructor
+func NewProductsConsumerGroup(
+	brokers []string,
+	groupID string,
+	log logger.Logger,
+	cfg *config.Config,
+	productsUC product.UseCase,
+	validate *validator.Validate,
+) *ProductsConsumerGroup {
+	return &ProductsConsumerGroup{
+		Brokers:    brokers,
+		GroupID:    groupID,
+		log:        log,
+		cfg:        cfg,
+		productsUC: productsUC,
+		validate:   validate,
+	}
+}
+
+func (pcg *ProductsConsumerGroup) getNewKafkaReader(kafkaURL []string, topic, groupID string) *kafka.Reader {
+	return kafka.NewReader(kafka.ReaderConfig{
+		Brokers:                kafkaURL,
+		GroupID:                groupID,
+		Topic:                  topic,
+		MinBytes:               minBytes,
+		MaxBytes:               maxBytes,
+		QueueCapacity:          queueCapacity,
+		HeartbeatInterval:      heartbeatInterval,
+		CommitInterval:         commitInterval,
+		PartitionWatchInterval: partitionWatchInterval,
+		Logger:                 kafka.LoggerFunc(pcg.log.Debugf),
+		ErrorLogger:            kafka.LoggerFunc(pcg.log.Errorf),
+		MaxAttempts:            maxAttempts,
+		Dialer: &kafka.Dialer{
+			Timeout: dialTimeout,
+		},
+	})
+}
+
+func (pcg *ProductsConsumerGroup) getNewKafkaWriter(topic string) *kafka.Writer {
+	w := &kafka.Writer{
+		Addr:         kafka.TCP(pcg.Brokers...),
+		Topic:        topic,
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: writerRequiredAcks,
+		MaxAttempts:  writerMaxAttempts,
+		Logger:       kafka.LoggerFunc(pcg.log.Debugf),
+		ErrorLogger:  kafka.LoggerFunc(pcg.log.Errorf),
+		Compression:  compress.Snappy,
+		ReadTimeout:  writerReadTimeout,
+		WriteTimeout: writerWriteTimeout,
+	}
+	return w
+}
+
+func (pcg *ProductsConsumerGroup) consumeCreateProduct(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	groupID string,
+	topic string,
+	workersNum int,
+) {
+	r := pcg.getNewKafkaReader(pcg.Brokers, topic, groupID)
+	defer cancel()
+	defer func() {
+		if err := r.Close(); err != nil {
+			pcg.log.Errorf("r.Close", err)
+			cancel()
+		}
+	}()
+
+	w := pcg.getNewKafkaWriter(deadLetterQueueTopic)
+	defer func() {
+		if err := w.Close(); err != nil {
+			pcg.log.Errorf("w.Close", err)
+			cancel()
+		}
+	}()
+
+	pcg.log.Infof("Starting consumer group: %v", r.Config().GroupID)
+
+	wg := &sync.WaitGroup{}
+	for i := 0; i <= workersNum; i++ {
+		wg.Add(1)
+		go pcg.createProductWorker(ctx, cancel, r, w, wg, i)
+	}
+	wg.Wait()
+}
+
+func (pcg *ProductsConsumerGroup) consumeUpdateProduct(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	groupID string,
+	topic string,
+	workersNum int,
+) {
+	r := pcg.getNewKafkaReader(pcg.Brokers, topic, groupID)
+	defer cancel()
+	defer func() {
+		if err := r.Close(); err != nil {
+			pcg.log.Errorf("r.Close", err)
+			cancel()
+		}
+	}()
+
+	w := pcg.getNewKafkaWriter(deadLetterQueueTopic)
+	defer func() {
+		if err := w.Close(); err != nil {
+			pcg.log.Errorf("w.Close", err)
+			cancel()
+		}
+	}()
+
+	pcg.log.Infof("Starting consumer group: %v", r.Config().GroupID)
+
+	wg := &sync.WaitGroup{}
+	for i := 0; i <= workersNum; i++ {
+		wg.Add(1)
+		go pcg.updateProductWorker(ctx, cancel, r, w, wg, i)
+	}
+	wg.Wait()
+}
+
+func (pcg *ProductsConsumerGroup) publishErrorMessage(ctx context.Context, w *kafka.Writer, m kafka.Message, err error) error {
+	errMsg := &models.ErrorMessage{
+		Offset:    m.Offset,
+		Error:     err.Error(),
+		Time:      m.Time.UTC(),
+		Partition: m.Partition,
+		Topic:     m.Topic,
+	}
+
+	errMsgBytes, err := json.Marshal(errMsg)
+	if err != nil {
+		return err
+	}
+
+	return w.WriteMessages(ctx, kafka.Message{
+		Value: errMsgBytes,
+	})
+}
+
+// RunConsumers run kafka consumers
+func (pcg *ProductsConsumerGroup) RunConsumers(ctx context.Context, cancel context.CancelFunc) {
+	go pcg.consumeCreateProduct(ctx, cancel, productsGroupID, createProductTopic, createProductWorkers)
+	go pcg.consumeUpdateProduct(ctx, cancel, productsGroupID, updateProductTopic, updateProductWorkers)
+}
+
+
+File: 
+internal\product\delivery\kafka\producer.go
+Content: 
+package kafka
+
+import (
+	"context"
+
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/compress"
+
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+)
+
+// ProductsProducer interface
+type ProductsProducer interface {
+	PublishCreate(ctx context.Context, msgs ...kafka.Message) error
+	PublishUpdate(ctx context.Context, msgs ...kafka.Message) error
+	Close()
+	Run()
+	GetNewKafkaWriter(topic string) *kafka.Writer
+}
+
+type productsProducer struct {
+	log          logger.Logger
+	cfg          *config.Config
+	createWriter *kafka.Writer
+	updateWriter *kafka.Writer
+}
+
+// NewProductsProducer constructor
+func NewProductsProducer(log logger.Logger, cfg *config.Config) *productsProducer {
+	return &productsProducer{log: log, cfg: cfg}
+}
+
+// GetNewKafkaWriter Create new kafka writer
+func (p *productsProducer) GetNewKafkaWriter(topic string) *kafka.Writer {
+	w := &kafka.Writer{
+		Addr:         kafka.TCP(p.cfg.Kafka.Brokers...),
+		Topic:        topic,
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: writerRequiredAcks,
+		MaxAttempts:  writerMaxAttempts,
+		Logger:       kafka.LoggerFunc(p.log.Debugf),
+		ErrorLogger:  kafka.LoggerFunc(p.log.Errorf),
+		Compression:  compress.Snappy,
+		ReadTimeout:  writerReadTimeout,
+		WriteTimeout: writerWriteTimeout,
+	}
+	return w
+}
+
+// Run init producers writers
+func (p *productsProducer) Run() {
+	p.createWriter = p.GetNewKafkaWriter(createProductTopic)
+	p.updateWriter = p.GetNewKafkaWriter(updateProductTopic)
+}
+
+// Close close writers
+func (p productsProducer) Close() {
+	p.createWriter.Close()
+	p.updateWriter.Close()
+}
+
+// PublishCreate publish messages to create topic
+func (p *productsProducer) PublishCreate(ctx context.Context, msgs ...kafka.Message) error {
+	return p.createWriter.WriteMessages(ctx, msgs...)
+}
+
+// PublishUpdate publish messages to update topic
+func (p *productsProducer) PublishUpdate(ctx context.Context, msgs ...kafka.Message) error {
+	return p.updateWriter.WriteMessages(ctx, msgs...)
+}
+
+
+File: 
+internal\product\delivery\kafka\workers.go
+Content: 
+package kafka
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+	"time"
+
+	"github.com/avast/retry-go"
+	"github.com/segmentio/kafka-go"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+)
+
+const (
+	retryAttempts = 1
+	retryDelay    = 1 * time.Second
+)
+
+func (pcg *ProductsConsumerGroup) createProductWorker(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	r *kafka.Reader,
+	w *kafka.Writer,
+	wg *sync.WaitGroup,
+	workerID int,
+) {
+	defer wg.Done()
+	defer cancel()
+
+	for {
+		m, err := r.FetchMessage(ctx)
+		if err != nil {
+			pcg.log.Errorf("FetchMessage", err)
+			return
+		}
+
+		pcg.log.Infof(
+			"WORKER: %v, message at topic/partition/offset %v/%v/%v: %s = %s\n",
+			workerID,
+			m.Topic,
+			m.Partition,
+			m.Offset,
+			string(m.Key),
+			string(m.Value),
+		)
+		incomingMessages.Inc()
+
+		var prod models.Product
+		if err := json.Unmarshal(m.Value, &prod); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("json.Unmarshal", err)
+			continue
+		}
+
+		if err := pcg.validate.StructCtx(ctx, prod); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("validate.StructCtx", err)
+			continue
+		}
+
+		if err := retry.Do(func() error {
+			created, err := pcg.productsUC.Create(ctx, &prod)
+			if err != nil {
+				return err
+			}
+			pcg.log.Infof("created product: %v", created)
+			return nil
+		},
+			retry.Attempts(retryAttempts),
+			retry.Delay(retryDelay),
+			retry.Context(ctx),
+		); err != nil {
+			errorMessages.Inc()
+
+			if err := pcg.publishErrorMessage(ctx, w, m, err); err != nil {
+				pcg.log.Errorf("publishErrorMessage", err)
+				continue
+			}
+			pcg.log.Errorf("productsUC.Create.publishErrorMessage", err)
+			continue
+		}
+
+		if err := r.CommitMessages(ctx, m); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("CommitMessages", err)
+			continue
+		}
+
+		successMessages.Inc()
+	}
+}
+
+func (pcg *ProductsConsumerGroup) updateProductWorker(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	r *kafka.Reader,
+	w *kafka.Writer,
+	wg *sync.WaitGroup,
+	workerID int,
+) {
+	defer wg.Done()
+	defer cancel()
+
+	for {
+		m, err := r.FetchMessage(ctx)
+		if err != nil {
+			pcg.log.Errorf("FetchMessage", err)
+			return
+		}
+
+		pcg.log.Infof(
+			"WORKER: %v, message at topic/partition/offset %v/%v/%v: %s = %s\n",
+			workerID,
+			m.Topic,
+			m.Partition,
+			m.Offset,
+			string(m.Key),
+			string(m.Value),
+		)
+		incomingMessages.Inc()
+
+		var prod models.Product
+		if err := json.Unmarshal(m.Value, &prod); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("json.Unmarshal", err)
+			continue
+		}
+
+		if err := pcg.validate.StructCtx(ctx, prod); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("validate.StructCtx", err)
+			continue
+		}
+
+		if err := retry.Do(func() error {
+			updated, err := pcg.productsUC.Update(ctx, &prod)
+			if err != nil {
+				return err
+			}
+			pcg.log.Debugf("updated product: %v", updated)
+			return nil
+		},
+			retry.Attempts(retryAttempts),
+			retry.Delay(retryDelay),
+			retry.Context(ctx),
+		); err != nil {
+			errorMessages.Inc()
+
+			if err := pcg.publishErrorMessage(ctx, w, m, err); err != nil {
+				pcg.log.Errorf("publishErrorMessage", err)
+				continue
+			}
+			pcg.log.Errorf("productsUC.Create.publishErrorMessage", err)
+			continue
+		}
+
+		if err := r.CommitMessages(ctx, m); err != nil {
+			errorMessages.Inc()
+			pcg.log.Errorf("CommitMessages", err)
+			continue
+		}
+
+		successMessages.Inc()
+	}
+}
+
+
+File: 
+internal\product\repository.go
+Content: 
+package product
+
+import (
+	"context"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+)
+
+// MongoRepository Product
+type MongoRepository interface {
+	Create(ctx context.Context, product *models.Product) (*models.Product, error)
+	Update(ctx context.Context, product *models.Product) (*models.Product, error)
+	GetByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error)
+	Search(ctx context.Context, search string, pagination *utils.Pagination) (*models.ProductsList, error)
+}
+
+// RedisRepository Product
+type RedisRepository interface {
+	SetProduct(ctx context.Context, product *models.Product) error
+	GetProductByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error)
+	DeleteProduct(ctx context.Context, productID primitive.ObjectID) error
+}
+
+
+File: 
+internal\product\repository\mongo_repository.go
+Content: 
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	productErrors "github.com/AleksK1NG/products-microservice/pkg/product_errors"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+)
+
+const (
+	productsDB         = "products"
+	productsCollection = "products"
+)
+
+// productMongoRepo
+type productMongoRepo struct {
+	mongoDB *mongo.Client
+}
+
+// NewProductMongoRepo productMongoRepo constructor
+func NewProductMongoRepo(mongoDB *mongo.Client) *productMongoRepo {
+	return &productMongoRepo{mongoDB: mongoDB}
+}
+
+// Create Create new product
+func (p *productMongoRepo) Create(ctx context.Context, product *models.Product) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productMongoRepo.Create")
+	defer span.Finish()
+
+	collection := p.mongoDB.Database(productsDB).Collection(productsCollection)
+
+	product.CreatedAt = time.Now().UTC()
+	product.UpdatedAt = time.Now().UTC()
+
+	result, err := collection.InsertOne(ctx, product, &options.InsertOneOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "InsertOne")
+	}
+
+	objectID, ok := result.InsertedID.(primitive.ObjectID)
+	if !ok {
+		return nil, errors.Wrap(productErrors.ErrObjectIDTypeConversion, "result.InsertedID")
+	}
+
+	product.ProductID = objectID
+
+	return product, nil
+}
+
+// Update Single product
+func (p *productMongoRepo) Update(ctx context.Context, product *models.Product) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productMongoRepo.Update")
+	defer span.Finish()
+
+	collection := p.mongoDB.Database(productsDB).Collection(productsCollection)
+
+	ops := options.FindOneAndUpdate()
+	ops.SetReturnDocument(options.After)
+	ops.SetUpsert(true)
+
+	var prod models.Product
+	if err := collection.FindOneAndUpdate(ctx, bson.M{"_id": product.ProductID}, bson.M{"$set": product}, ops).Decode(&prod); err != nil {
+		return nil, errors.Wrap(err, "Decode")
+	}
+
+	return &prod, nil
+}
+
+// GetByID Get single product by id
+func (p *productMongoRepo) GetByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productMongoRepo.GetByID")
+	defer span.Finish()
+
+	collection := p.mongoDB.Database(productsDB).Collection(productsCollection)
+
+	var prod models.Product
+	if err := collection.FindOne(ctx, bson.M{"_id": productID}).Decode(&prod); err != nil {
+		return nil, errors.Wrap(err, "Decode")
+	}
+
+	return &prod, nil
+}
+
+// Search Search product
+func (p *productMongoRepo) Search(ctx context.Context, search string, pagination *utils.Pagination) (*models.ProductsList, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productMongoRepo.Search")
+	defer span.Finish()
+
+	collection := p.mongoDB.Database(productsDB).Collection(productsCollection)
+
+	f := bson.D{
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "name", Value: primitive.Regex{
+				Pattern: search,
+				Options: "gi",
+			}}},
+			bson.D{{Key: "description", Value: primitive.Regex{
+				Pattern: search,
+				Options: "gi",
+			}}},
+		}},
+	}
+
+	count, err := collection.CountDocuments(ctx, f)
+	if err != nil {
+		return nil, errors.Wrap(err, "CountDocuments")
+	}
+	if count == 0 {
+		return &models.ProductsList{
+			TotalCount: 0,
+			TotalPages: 0,
+			Page:       0,
+			Size:       0,
+			HasMore:    false,
+			Products:   make([]*models.Product, 0),
+		}, nil
+	}
+
+	limit := int64(pagination.GetLimit())
+	skip := int64(pagination.GetOffset())
+	cursor, err := collection.Find(ctx, f, &options.FindOptions{
+		Limit: &limit,
+		Skip:  &skip,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "Find")
+	}
+	defer cursor.Close(ctx)
+
+	products := make([]*models.Product, 0, pagination.GetSize())
+	for cursor.Next(ctx) {
+		var prod models.Product
+		if err := cursor.Decode(&prod); err != nil {
+			return nil, errors.Wrap(err, "Find")
+		}
+		products = append(products, &prod)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, errors.Wrap(err, "cursor.Err")
+	}
+
+	return &models.ProductsList{
+		TotalCount: count,
+		TotalPages: int64(pagination.GetTotalPages(int(count))),
+		Page:       int64(pagination.GetPage()),
+		Size:       int64(pagination.GetSize()),
+		HasMore:    pagination.GetHasMore(int(count)),
+		Products:   products,
+	}, nil
+}
+
+
+File: 
+internal\product\repository\redis_repository.go
+Content: 
+package repository
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+)
+
+const (
+	prefix     = "products"
+	expiration = time.Second * 3600
+)
+
+type productRedisRepository struct {
+	prefix string
+	redis  *redis.Client
+}
+
+// NewProductRedisRepository constructor
+func NewProductRedisRepository(redis *redis.Client) *productRedisRepository {
+	return &productRedisRepository{redis: redis, prefix: prefix}
+}
+
+func (p *productRedisRepository) SetProduct(ctx context.Context, product *models.Product) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productRedisRepository.SetProduct")
+	defer span.Finish()
+
+	prodBytes, err := json.Marshal(product)
+	if err != nil {
+		return errors.Wrap(err, "productRedisRepository.Marshal")
+	}
+
+	return p.redis.SetEX(ctx, p.createKey(product.ProductID), string(prodBytes), expiration).Err()
+}
+
+func (p *productRedisRepository) GetProductByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productRedisRepository.GetProductByID")
+	defer span.Finish()
+
+	result, err := p.redis.Get(ctx, p.createKey(productID)).Bytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "productRedisRepository.redis.Get")
+	}
+
+	var res models.Product
+	if err := json.Unmarshal(result, &res); err != nil {
+		return nil, errors.Wrap(err, "json.Unmarshal")
+	}
+	return &res, nil
+}
+
+func (p *productRedisRepository) DeleteProduct(ctx context.Context, productID primitive.ObjectID) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productRedisRepository.DeleteProduct")
+	defer span.Finish()
+
+	return p.redis.Del(ctx, p.createKey(productID)).Err()
+}
+
+func (p *productRedisRepository) createKey(id primitive.ObjectID) string {
+	return fmt.Sprintf("%s: %s", p.prefix, id.String())
+}
+
+
+File: 
+internal\product\usecase.go
+Content: 
+package product
+
+import (
+	"context"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+)
+
+// UseCase Product
+type UseCase interface {
+	Create(ctx context.Context, product *models.Product) (*models.Product, error)
+	Update(ctx context.Context, product *models.Product) (*models.Product, error)
+	GetByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error)
+	Search(ctx context.Context, search string, pagination *utils.Pagination) (*models.ProductsList, error)
+	PublishCreate(ctx context.Context, product *models.Product) error
+	PublishUpdate(ctx context.Context, product *models.Product) error
+}
+
+
+File: 
+internal\product\usecase\usecase.go
+Content: 
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"github.com/segmentio/kafka-go"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"github.com/AleksK1NG/products-microservice/internal/models"
+	"github.com/AleksK1NG/products-microservice/internal/product"
+	prodKafka "github.com/AleksK1NG/products-microservice/internal/product/delivery/kafka"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+	"github.com/AleksK1NG/products-microservice/pkg/utils"
+)
+
+// productUC
+type productUC struct {
+	productRepo  product.MongoRepository
+	redisRepo    product.RedisRepository
+	log          logger.Logger
+	prodProducer prodKafka.ProductsProducer
+}
+
+// NewProductUC constructor
+func NewProductUC(
+	productRepo product.MongoRepository,
+	redisRepo product.RedisRepository,
+	log logger.Logger,
+	prodProducer prodKafka.ProductsProducer,
+) *productUC {
+	return &productUC{productRepo: productRepo, redisRepo: redisRepo, log: log, prodProducer: prodProducer}
+}
+
+// Create Create new product
+func (p *productUC) Create(ctx context.Context, product *models.Product) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.Create")
+	defer span.Finish()
+	return p.productRepo.Create(ctx, product)
+}
+
+// Update single product
+func (p *productUC) Update(ctx context.Context, product *models.Product) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.Update")
+	defer span.Finish()
+
+	prod, err := p.productRepo.Update(ctx, product)
+	if err != nil {
+		return nil, errors.Wrap(err, "Update")
+	}
+
+	if err := p.redisRepo.SetProduct(ctx, prod); err != nil {
+		p.log.Errorf("redisRepo.SetProduct: %v", err)
+	}
+
+	return prod, nil
+}
+
+// GetByID Get single product by id
+func (p *productUC) GetByID(ctx context.Context, productID primitive.ObjectID) (*models.Product, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.GetByID")
+	defer span.Finish()
+
+	cached, err := p.redisRepo.GetProductByID(ctx, productID)
+	if err != nil && err != redis.Nil {
+		p.log.Errorf("redisRepo.GetProductByID: %v", err)
+	}
+	if cached != nil {
+		return cached, nil
+	}
+
+	prod, err := p.productRepo.GetByID(ctx, productID)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetByID")
+	}
+
+	if err := p.redisRepo.SetProduct(ctx, prod); err != nil {
+		p.log.Errorf("redisRepo.SetProduct: %v", err)
+	}
+
+	return prod, nil
+}
+
+// Search Search products
+func (p *productUC) Search(ctx context.Context, search string, pagination *utils.Pagination) (*models.ProductsList, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.Search")
+	defer span.Finish()
+	return p.productRepo.Search(ctx, search, pagination)
+}
+
+// PublishCreate create new product
+func (p *productUC) PublishCreate(ctx context.Context, product *models.Product) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.PublishCreate")
+	defer span.Finish()
+
+	prodBytes, err := json.Marshal(&product)
+	if err != nil {
+		return errors.Wrap(err, "json.Marshal")
+	}
+
+	return p.prodProducer.PublishCreate(ctx, kafka.Message{
+		Value: prodBytes,
+		Time:  time.Now().UTC(),
+	})
+}
+
+// PublishUpdate update new product
+func (p *productUC) PublishUpdate(ctx context.Context, product *models.Product) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "productUC.PublishUpdate")
+	defer span.Finish()
+
+	prodBytes, err := json.Marshal(&product)
+	if err != nil {
+		return errors.Wrap(err, "json.Marshal")
+	}
+
+	return p.prodProducer.PublishUpdate(ctx, kafka.Message{
+		Value: prodBytes,
+		Time:  time.Now().UTC(),
+	})
+}
+
+
+File: 
+internal\server\http.go
+Content: 
+package server
+
+import (
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/AleksK1NG/products-microservice/docs"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	echoSwagger "github.com/swaggo/echo-swagger"
+)
+
+// runHTTPServer starts the HTTP server. This call will BLOCK until the server is closed or errors out.
+func (s *server) runHTTPServer() error {
+	// Basic routes
+	s.echo.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "Server running on HTTP")
+	})
+
+	s.echo.GET("/test", func(c echo.Context) error {
+		return c.String(http.StatusOK, "Test route working!")
+	})
+
+	s.echo.GET("/health", func(c echo.Context) error {
+		return c.String(http.StatusOK, "Ok")
+	})
+
+	s.echo.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
+
+	// Configure Swagger *for HTTP* (no HTTPS).
+	docs.SwaggerInfo.Title = "Products microservice"
+	docs.SwaggerInfo.Description = "Products REST API microservice."
+	docs.SwaggerInfo.Version = "1.0"
+	docs.SwaggerInfo.BasePath = "/api/v1"
+	docs.SwaggerInfo.Host = "localhost:5007"
+	docs.SwaggerInfo.Schemes = []string{"http"}
+
+	s.echo.GET("/swagger/*", echoSwagger.WrapHandler)
+	s.echo.GET("/swagger", func(c echo.Context) error {
+		// If user goes to /swagger, redirect them to /swagger/index.html
+		return c.Redirect(http.StatusMovedPermanently, "/swagger/index.html")
+	})
+
+	// Common middleware (no SSL/HTTPS redirection):
+	s.echo.Use(middleware.Logger())
+	s.echo.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowHeaders: []string{
+			echo.HeaderOrigin,
+			echo.HeaderContentType,
+			echo.HeaderAccept,
+			echo.HeaderXRequestID,
+			csrfTokenHeader,
+		},
+	}))
+	s.echo.Use(middleware.Recover())
+	s.echo.Use(middleware.RequestID())
+	s.echo.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Level: gzipLevel,
+		Skipper: func(c echo.Context) bool {
+			return strings.Contains(c.Request().URL.Path, "swagger")
+		},
+	}))
+	s.echo.Use(middleware.BodyLimit(bodyLimit))
+
+	addr := s.cfg.Http.Port
+	if !strings.HasPrefix(addr, ":") {
+		addr = ":" + addr
+	}
+
+	s.echo.Server.ReadTimeout = time.Second * s.cfg.Http.ReadTimeout
+	s.echo.Server.WriteTimeout = time.Second * s.cfg.Http.WriteTimeout
+	s.echo.Server.MaxHeaderBytes = maxHeaderBytes
+
+	s.log.Infof("Starting HTTP server on %s", addr)
+	// BLOCKING call (will not return until the server is closed or fails).
+	return s.echo.Start(addr)
+}
+
+
+File: 
+internal\server\server.go
+Content: 
+package server
+
+import (
+	"context"
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	// Core dependencies
+	"github.com/go-playground/validator/v10"
+	"github.com/go-redis/redis/v8"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.mongodb.org/mongo-driver/mongo"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
+	// gRPC middleware
+	grpcrecovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
+	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
+	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+
+	// Echo
+	"github.com/labstack/echo/v4"
+
+	// Internal packages
+	"github.com/AleksK1NG/products-microservice/config"
+	"github.com/AleksK1NG/products-microservice/internal/interceptors"
+	"github.com/AleksK1NG/products-microservice/internal/middlewares"
+
+	// IMPORTANT: rename your local “internal/product/delivery/grpc” package to avoid name collision:
+	productGrpc "github.com/AleksK1NG/products-microservice/internal/product/delivery/grpc"
+	productsHttpV1 "github.com/AleksK1NG/products-microservice/internal/product/delivery/http/v1"
+	"github.com/AleksK1NG/products-microservice/internal/product/delivery/kafka"
+	"github.com/AleksK1NG/products-microservice/internal/product/repository"
+	"github.com/AleksK1NG/products-microservice/internal/product/usecase"
+	"github.com/AleksK1NG/products-microservice/pkg/logger"
+	productsService "github.com/AleksK1NG/products-microservice/proto/product"
+)
+
+const (
+	maxHeaderBytes  = 1 << 20
+	gzipLevel       = 5
+	stackSize       = 1 << 10
+	csrfTokenHeader = "X-CSRF-Token"
+	bodyLimit       = "2M"
+
+	kafkaGroupID = "products_group"
+)
+
+type server struct {
+	log     logger.Logger
+	cfg     *config.Config
+	tracer  opentracing.Tracer
+	mongoDB *mongo.Client
+	echo    *echo.Echo
+	redis   *redis.Client
+}
+
+// NewServer constructs our main server object.
+func NewServer(
+	log logger.Logger,
+	cfg *config.Config,
+	tracer opentracing.Tracer,
+	mongoDB *mongo.Client,
+	redis *redis.Client,
+) *server {
+	return &server{
+		log:     log,
+		cfg:     cfg,
+		tracer:  tracer,
+		mongoDB: mongoDB,
+		echo:    echo.New(),
+		redis:   redis,
+	}
+}
+
+// Run starts up everything (gRPC, Kafka consumers, and the HTTP server).
+func (s *server) Run() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Validator for incoming requests.
+	validate := validator.New()
+
+	// Kafka Producer.
+	productsProducer := kafka.NewProductsProducer(s.log, s.cfg)
+	productsProducer.Run()
+	defer productsProducer.Close()
+
+	// Setup Repos & UseCase.
+	productMongoRepo := repository.NewProductMongoRepo(s.mongoDB)
+	productRedisRepo := repository.NewProductRedisRepository(s.redis)
+	productUC := usecase.NewProductUC(productMongoRepo, productRedisRepo, s.log, productsProducer)
+
+	// Interceptors & Middlewares.
+	im := interceptors.NewInterceptorManager(s.log, s.cfg)
+	mw := middlewares.NewMiddlewareManager(s.log, s.cfg)
+
+	// gRPC Server setup.
+	grpcAddr := s.cfg.Server.Port
+	if !strings.HasPrefix(grpcAddr, ":") {
+		grpcAddr = ":" + grpcAddr
+	}
+	listener, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		return errors.Wrap(err, "net.Listen")
+	}
+
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: s.cfg.Server.MaxConnectionIdle * time.Minute,
+			Timeout:           s.cfg.Server.Timeout * time.Second,
+			MaxConnectionAge:  s.cfg.Server.MaxConnectionAge * time.Minute,
+			Time:              s.cfg.Server.Timeout * time.Minute,
+		}),
+		grpc.ChainUnaryInterceptor(
+			grpc_ctxtags.UnaryServerInterceptor(),
+			grpc_opentracing.UnaryServerInterceptor(),
+			grpc_prometheus.UnaryServerInterceptor,
+			grpcrecovery.UnaryServerInterceptor(),
+			im.Logger,
+		),
+	)
+
+	// Register our product service implementation with gRPC.
+	prodSvc := productGrpc.NewProductService(s.log, productUC, validate)
+	productsService.RegisterProductsServiceServer(grpcServer, prodSvc)
+	grpc_prometheus.Register(grpcServer)
+
+	// HTTP routes for /api/v1/products (this is separate from the top-level routes in http.go).
+	v1 := s.echo.Group("/api/v1")
+	v1.Use(mw.Metrics)
+
+	productHandlers := productsHttpV1.NewProductHandlers(s.log, productUC, validate, v1.Group("/products"), mw)
+	productHandlers.MapRoutes()
+
+	// Kafka Consumer Group.
+	productsCG := kafka.NewProductsConsumerGroup(
+		s.cfg.Kafka.Brokers,
+		kafkaGroupID,
+		s.log,
+		s.cfg,
+		productUC,
+		validate,
+	)
+
+	// Start gRPC in background.
+	go func() {
+		s.log.Infof("gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(listener); err != nil {
+			s.log.Errorf("gRPC server error: %v", err)
+			cancel()
+		}
+	}()
+
+	// Start Kafka consumers in background.
+	go productsCG.RunConsumers(ctx, cancel)
+
+	// Start a separate metrics server in background (optional).
+	go func() {
+		m := echo.New()
+		m.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
+		s.log.Infof("Metrics server on %s", s.cfg.Metrics.Port)
+		if err := m.Start(s.cfg.Metrics.Port); err != nil {
+			s.log.Errorf("Metrics server: %v", err)
+			cancel()
+		}
+	}()
+
+	// Start the main HTTP server (defined in http.go), in background.
+	go func() {
+		if errHTTP := s.runHTTPServer(); errHTTP != nil {
+			s.log.Errorf("HTTP server error: %v", errHTTP)
+			cancel()
+		}
+	}()
+
+	// Wait for OS signal or context cancellation.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		s.log.Warnf("Received signal: %v, shutting down...", sig)
+	case <-ctx.Done():
+		s.log.Warnf("Context canceled, shutting down servers...")
+	}
+
+	// Graceful shutdown attempts:
+	grpcServer.GracefulStop()
+	if err := s.echo.Shutdown(context.Background()); err != nil {
+		s.log.Errorf("Error on shutting down HTTP server: %v", err)
+	}
+	_ = listener.Close()
+
+	s.log.Info("Server exited properly")
+	return nil
+}
+
+
+File: 
+monitoring\prometheus-local.yml
+Content: 
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: [ 'localhost:9090' ]
+
+  - job_name: 'system'
+    static_configs:
+      - targets: [ 'host.docker.internal:9101' ]
+
+  - job_name: 'products-microservice'
+    static_configs:
+      - targets: [ 'host.docker.internal:7070' ]
+
+
+File: 
+monitoring\prometheus.yml
+Content: 
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: [ 'localhost:9090' ]
+
+  - job_name: 'system'
+    static_configs:
+      - targets: [ 'host.docker.internal:9101' ]
+
+  - job_name: 'products-microservice'
+    static_configs:
+      - targets: [ 'host.docker.internal:7070' ]
+
+
+File: 
+pkg\grpc_errors\grpc_errors.go
+Content: 
+package grpcErrors
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+var (
+	ErrNotFound         = errors.New("Not found")
+	ErrNoCtxMetaData    = errors.New("No ctx metadata")
+	ErrInvalidSessionId = errors.New("Invalid session id")
+	ErrEmailExists      = errors.New("Email already exists")
+)
+
+// ParseGRPCErrStatusCode Parse error and get code
+func ParseGRPCErrStatusCode(err error) codes.Code {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return codes.NotFound
+	case errors.Is(err, context.Canceled):
+		return codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return codes.DeadlineExceeded
+	case errors.Is(err, ErrEmailExists):
+		return codes.AlreadyExists
+	case errors.Is(err, ErrNoCtxMetaData):
+		return codes.Unauthenticated
+	case errors.Is(err, ErrInvalidSessionId):
+		return codes.PermissionDenied
+	case strings.Contains(err.Error(), "Validate"):
+		return codes.InvalidArgument
+	case strings.Contains(err.Error(), "redis"):
+		return codes.NotFound
+	case errors.Is(err, context.Canceled):
+		return codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return codes.DeadlineExceeded
+	}
+	return codes.Internal
+}
+
+// MapGRPCErrCodeToHttpStatus Map GRPC errors codes to http status
+func MapGRPCErrCodeToHttpStatus(code codes.Code) int {
+	switch code {
+	case codes.Unauthenticated:
+		return http.StatusUnauthorized
+	case codes.AlreadyExists:
+		return http.StatusBadRequest
+	case codes.NotFound:
+		return http.StatusNotFound
+	case codes.Internal:
+		return http.StatusInternalServerError
+	case codes.PermissionDenied:
+		return http.StatusForbidden
+	case codes.Canceled:
+		return http.StatusRequestTimeout
+	case codes.DeadlineExceeded:
+		return http.StatusGatewayTimeout
+	case codes.InvalidArgument:
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+// ErrorResponse GRPC Error response
+func ErrorResponse(err error, msg string) error {
+	return status.Errorf(ParseGRPCErrStatusCode(err), fmt.Sprintf("%s: %v", msg, err))
+}
+
+
+File: 
+pkg\http_errors\http_errors.go
+Content: 
+package httpErrors
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/labstack/echo/v4"
+)
+
+const (
+	ErrBadRequest       = "Bad request"
+	ErrAlreadyExists    = "Already exists"
+	ErrNoSuchUser       = "User not found"
+	ErrWrongCredentials = "Wrong Credentials"
+	ErrNotFound         = "Not Found"
+	ErrUnauthorized     = "Unauthorized"
+	ErrForbidden        = "Forbidden"
+	ErrBadQueryParams   = "Invalid query params"
+	ErrRequestTimeout   = "Request Timeout"
+	ErrInvalidEmail     = "Invalid email"
+	ErrInvalidPassword  = "Invalid password"
+	ErrInvalidField     = "Invalid field"
+)
+
+var (
+	BadRequest            = errors.New("Bad request")
+	WrongCredentials      = errors.New("Wrong Credentials")
+	NotFound              = errors.New("Not Found")
+	Unauthorized          = errors.New("Unauthorized")
+	Forbidden             = errors.New("Forbidden")
+	PermissionDenied      = errors.New("Permission Denied")
+	ExpiredCSRFError      = errors.New("Expired CSRF token")
+	WrongCSRFToken        = errors.New("Wrong CSRF token")
+	CSRFNotPresented      = errors.New("CSRF not presented")
+	NotRequiredFields     = errors.New("No such required fields")
+	BadQueryParams        = errors.New("Invalid query params")
+	InternalServerError   = errors.New("Internal Server Error")
+	RequestTimeoutError   = errors.New("Request Timeout")
+	ExistsEmailError      = errors.New("User with given email already exists")
+	InvalidJWTToken       = errors.New("Invalid JWT token")
+	InvalidJWTClaims      = errors.New("Invalid JWT claims")
+	NotAllowedImageHeader = errors.New("Not allowed image header")
+	NoCookie              = errors.New("not found cookie header")
+	InvalidUUID           = errors.New("invalid uuid")
+)
+
+// Rest error interface
+type RestErr interface {
+	Status() int
+	Error() string
+	Causes() interface{}
+	ErrBody() RestError
+}
+
+// Rest error struct
+type RestError struct {
+	ErrStatus int         `json:"status,omitempty"`
+	ErrError  string      `json:"error,omitempty"`
+	ErrCauses interface{} `json:"err_causes,omitempty"`
+}
+
+// Error body
+func (e RestError) ErrBody() RestError {
+	return e
+}
+
+// Error  Error() interface method
+func (e RestError) Error() string {
+	return fmt.Sprintf("status: %d - errors: %s - causes: %v", e.ErrStatus, e.ErrError, e.ErrCauses)
+}
+
+// Error status
+func (e RestError) Status() int {
+	return e.ErrStatus
+}
+
+// RestError Causes
+func (e RestError) Causes() interface{} {
+	return e.ErrCauses
+}
+
+// New Rest Error
+func NewRestError(status int, err string, causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: status,
+		ErrError:  err,
+		ErrCauses: causes,
+	}
+}
+
+// New Rest Error With Message
+func NewRestErrorWithMessage(status int, err string, causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: status,
+		ErrError:  err,
+		ErrCauses: causes,
+	}
+}
+
+// New Rest Error From Bytes
+func NewRestErrorFromBytes(bytes []byte) (RestErr, error) {
+	var apiErr RestError
+	if err := json.Unmarshal(bytes, &apiErr); err != nil {
+		return nil, errors.New("invalid json")
+	}
+	return apiErr, nil
+}
+
+// New Bad Request Error
+func NewBadRequestError(causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: http.StatusBadRequest,
+		ErrError:  BadRequest.Error(),
+		ErrCauses: causes,
+	}
+}
+
+// New Not Found Error
+func NewNotFoundError(causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: http.StatusNotFound,
+		ErrError:  NotFound.Error(),
+		ErrCauses: causes,
+	}
+}
+
+// New Unauthorized Error
+func NewUnauthorizedError(causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: http.StatusUnauthorized,
+		ErrError:  Unauthorized.Error(),
+		ErrCauses: causes,
+	}
+}
+
+// New Forbidden Error
+func NewForbiddenError(causes interface{}) RestErr {
+	return RestError{
+		ErrStatus: http.StatusForbidden,
+		ErrError:  Forbidden.Error(),
+		ErrCauses: causes,
+	}
+}
+
+// New Internal Server Error
+func NewInternalServerError(causes interface{}) RestErr {
+	result := RestError{
+		ErrStatus: http.StatusInternalServerError,
+		ErrError:  InternalServerError.Error(),
+		ErrCauses: causes,
+	}
+	return result
+}
+
+// Parser of error string messages returns RestError
+func ParseErrors(err error) RestErr {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return NewRestError(http.StatusNotFound, ErrNotFound, nil)
+	case errors.Is(err, context.DeadlineExceeded):
+		return NewRestError(http.StatusRequestTimeout, ErrRequestTimeout, nil)
+	case errors.Is(err, Unauthorized):
+		return NewRestError(http.StatusUnauthorized, ErrUnauthorized, nil)
+	case errors.Is(err, WrongCredentials):
+		return NewRestError(http.StatusUnauthorized, ErrUnauthorized, nil)
+	case strings.Contains(strings.ToLower(err.Error()), "sqlstate"):
+		return parseSqlErrors(err)
+	case strings.Contains(strings.ToLower(err.Error()), "field validation"):
+		return parseValidatorError(err)
+	case strings.Contains(strings.ToLower(err.Error()), "unmarshal"):
+		return NewRestError(http.StatusBadRequest, ErrBadRequest, err)
+	case strings.Contains(strings.ToLower(err.Error()), "uuid"):
+		return NewRestError(http.StatusBadRequest, ErrBadRequest, err)
+	case strings.Contains(strings.ToLower(err.Error()), "cookie"):
+		return NewRestError(http.StatusUnauthorized, ErrUnauthorized, err)
+	case strings.Contains(strings.ToLower(err.Error()), "token"):
+		return NewRestError(http.StatusUnauthorized, ErrUnauthorized, err)
+	case strings.Contains(strings.ToLower(err.Error()), "bcrypt"):
+		return NewRestError(http.StatusBadRequest, ErrBadRequest, nil)
+	default:
+		if restErr, ok := err.(RestErr); ok {
+			return restErr
+		}
+		return NewInternalServerError(err)
+	}
+}
+
+func parseSqlErrors(err error) RestErr {
+	return NewRestError(http.StatusBadRequest, ErrBadRequest, err)
+}
+
+func parseValidatorError(err error) RestErr {
+	if strings.Contains(err.Error(), "Password") {
+		return NewRestError(http.StatusBadRequest, ErrInvalidPassword, err)
+	}
+
+	if strings.Contains(err.Error(), "Email") {
+		return NewRestError(http.StatusBadRequest, ErrInvalidEmail, err)
+	}
+
+	return NewRestError(http.StatusBadRequest, ErrInvalidField, err)
+}
+
+// Error response
+func ErrorResponse(err error) (int, interface{}) {
+	return ParseErrors(err).Status(), ParseErrors(err)
+}
+
+// Error response object and status code
+func ErrorCtxResponse(ctx echo.Context, err error) error {
+	restErr := ParseErrors(err)
+	return ctx.JSON(restErr.Status(), restErr.ErrBody())
+}
+
+
+File: 
+pkg\jaeger\jaeger.go
+Content: 
+package jaeger
+
+import (
+	"io"
+
+	"github.com/opentracing/opentracing-go"
+	"github.com/uber/jaeger-client-go"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
+	jaegerlog "github.com/uber/jaeger-client-go/log"
+	"github.com/uber/jaeger-lib/metrics"
+
+	"github.com/AleksK1NG/products-microservice/config"
+)
+
+// Init Jaeger
+func InitJaeger(cfg *config.Config) (opentracing.Tracer, io.Closer, error) {
+	jaegerCfgInstance := jaegercfg.Configuration{
+		ServiceName: cfg.Jaeger.ServiceName,
+		Sampler: &jaegercfg.SamplerConfig{
+			Type:  jaeger.SamplerTypeConst,
+			Param: 1,
+		},
+		Reporter: &jaegercfg.ReporterConfig{
+			LogSpans:           cfg.Jaeger.LogSpans,
+			LocalAgentHostPort: cfg.Jaeger.Host,
+		},
+	}
+
+	return jaegerCfgInstance.NewTracer(
+		jaegercfg.Logger(jaegerlog.StdLogger),
+		jaegercfg.Metrics(metrics.NullFactory),
+	)
+}
+
+
+File: 
+pkg\kafka\kafka.go
+Content: 
+package kafka
+
+import (
+	"context"
+
+	"github.com/segmentio/kafka-go"
+
+	"github.com/AleksK1NG/products-microservice/config"
+)
+
+func NewKafkaConn(cfg *config.Config) (*kafka.Conn, error) {
+	return kafka.DialContext(context.Background(), "tcp", cfg.Kafka.Brokers[0])
+}
+
+
+File: 
+pkg\logger\logger.go
+Content: 
+package logger
+
+import (
+	"os"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/AleksK1NG/products-microservice/config"
+)
+
+// Logger methods interface
+type Logger interface {
+	InitLogger()
+	Debug(args ...interface{})
+	Debugf(template string, args ...interface{})
+	Info(args ...interface{})
+	Infof(template string, args ...interface{})
+	Warn(args ...interface{})
+	Warnf(template string, args ...interface{})
+	Error(args ...interface{})
+	Errorf(template string, args ...interface{})
+	DPanic(args ...interface{})
+	DPanicf(template string, args ...interface{})
+	Fatal(args ...interface{})
+	Fatalf(template string, args ...interface{})
+	Printf(template string, args ...interface{})
+}
+
+// Logger
+type apiLogger struct {
+	cfg         *config.Config
+	sugarLogger *zap.SugaredLogger
+}
+
+// NewApiLogger App Logger constructor
+func NewApiLogger(cfg *config.Config) *apiLogger {
+	return &apiLogger{cfg: cfg}
+}
+
+// For mapping config logger to email_service logger levels
+var loggerLevelMap = map[string]zapcore.Level{
+	"debug":  zapcore.DebugLevel,
+	"info":   zapcore.InfoLevel,
+	"warn":   zapcore.WarnLevel,
+	"error":  zapcore.ErrorLevel,
+	"dpanic": zapcore.DPanicLevel,
+	"panic":  zapcore.PanicLevel,
+	"fatal":  zapcore.FatalLevel,
+}
+
+func (l *apiLogger) getLoggerLevel(cfg *config.Config) zapcore.Level {
+	level, exist := loggerLevelMap[cfg.Logger.Level]
+	if !exist {
+		return zapcore.DebugLevel
+	}
+
+	return level
+}
+
+// InitLogger Init logger
+func (l *apiLogger) InitLogger() {
+	logLevel := l.getLoggerLevel(l.cfg)
+
+	logWriter := zapcore.AddSync(os.Stderr)
+
+	var encoderCfg zapcore.EncoderConfig
+	if l.cfg.Server.Development {
+		encoderCfg = zap.NewDevelopmentEncoderConfig()
+	} else {
+		encoderCfg = zap.NewProductionEncoderConfig()
+	}
+
+	var encoder zapcore.Encoder
+	encoderCfg.LevelKey = "LEVEL"
+	encoderCfg.CallerKey = "CALLER"
+	encoderCfg.TimeKey = "TIME"
+	encoderCfg.NameKey = "NAME"
+	encoderCfg.MessageKey = "MESSAGE"
+
+	if l.cfg.Logger.Encoding == "console" {
+		encoder = zapcore.NewConsoleEncoder(encoderCfg)
+	} else {
+		encoder = zapcore.NewJSONEncoder(encoderCfg)
+	}
+
+	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	core := zapcore.NewCore(encoder, logWriter, zap.NewAtomicLevelAt(logLevel))
+	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
+
+	l.sugarLogger = logger.Sugar()
+	if err := l.sugarLogger.Sync(); err != nil {
+		l.sugarLogger.Error(err)
+	}
+}
+
+// Logger methods
+
+func (l *apiLogger) Debug(args ...interface{}) {
+	l.sugarLogger.Debug(args...)
+}
+
+func (l *apiLogger) Debugf(template string, args ...interface{}) {
+	l.sugarLogger.Debugf(template, args...)
+}
+
+func (l *apiLogger) Info(args ...interface{}) {
+	l.sugarLogger.Info(args...)
+}
+
+func (l *apiLogger) Infof(template string, args ...interface{}) {
+	l.sugarLogger.Infof(template, args...)
+}
+
+func (l *apiLogger) Printf(template string, args ...interface{}) {
+	l.sugarLogger.Infof(template, args...)
+}
+
+func (l *apiLogger) Warn(args ...interface{}) {
+	l.sugarLogger.Warn(args...)
+}
+
+func (l *apiLogger) Warnf(template string, args ...interface{}) {
+	l.sugarLogger.Warnf(template, args...)
+}
+
+func (l *apiLogger) Error(args ...interface{}) {
+	l.sugarLogger.Error(args...)
+}
+
+func (l *apiLogger) Errorf(template string, args ...interface{}) {
+	l.sugarLogger.Errorf(template, args...)
+}
+
+func (l *apiLogger) DPanic(args ...interface{}) {
+	l.sugarLogger.DPanic(args...)
+}
+
+func (l *apiLogger) DPanicf(template string, args ...interface{}) {
+	l.sugarLogger.DPanicf(template, args...)
+}
+
+func (l *apiLogger) Panic(args ...interface{}) {
+	l.sugarLogger.Panic(args...)
+}
+
+func (l *apiLogger) Panicf(template string, args ...interface{}) {
+	l.sugarLogger.Panicf(template, args...)
+}
+
+func (l *apiLogger) Fatal(args ...interface{}) {
+	l.sugarLogger.Fatal(args...)
+}
+
+func (l *apiLogger) Fatalf(template string, args ...interface{}) {
+	l.sugarLogger.Fatalf(template, args...)
+}
+
+
+File: 
+pkg\mongodb\mongodb.go
+Content: 
+package mongodb
+
+import (
+	"context"
+	"time"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/AleksK1NG/products-microservice/config"
+)
+
+const (
+	connectTimeout  = 30 * time.Second
+	maxConnIdleTime = 3 * time.Minute
+	minPoolSize     = 20
+	maxPoolSize     = 300
+)
+
+// NewMongoDBConn Create new MongoDB client
+func NewMongoDBConn(ctx context.Context, cfg *config.Config) (*mongo.Client, error) {
+	client, err := mongo.NewClient(
+		options.Client().ApplyURI(cfg.MongoDB.URI).
+			SetAuth(options.Credential{
+				Username: cfg.MongoDB.User,
+				Password: cfg.MongoDB.Password,
+			}).
+			SetConnectTimeout(connectTimeout).
+			SetMaxConnIdleTime(maxConnIdleTime).
+			SetMinPoolSize(minPoolSize).
+			SetMaxPoolSize(maxPoolSize))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := client.Connect(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+
+File: 
+pkg\product_errors\product_errors.go
+Content: 
+package productErrors
+
+import "github.com/pkg/errors"
+
+var (
+	ErrObjectIDTypeConversion = errors.New("object id type conversion")
+)
+
+
+File: 
+pkg\redis\redis.go
+Content: 
+package redis
+
+import (
+	"time"
+
+	"github.com/go-redis/redis/v8"
+
+	"github.com/AleksK1NG/products-microservice/config"
+)
+
+// NewRedisClient Returns new redis client
+func NewRedisClient(cfg *config.Config) *redis.Client {
+	redisHost := cfg.Redis.RedisAddr
+
+	if redisHost == "" {
+		redisHost = ":6379"
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:         redisHost,
+		MinIdleConns: cfg.Redis.MinIdleConn,
+		PoolSize:     cfg.Redis.PoolSize,
+		PoolTimeout:  time.Duration(cfg.Redis.PoolTimeout) * time.Second,
+		Password:     cfg.Redis.Password, // no password set
+		DB:           cfg.Redis.DB,       // use default DB
+	})
+
+	return client
+}
+
+
+File: 
+pkg\utils\pagination.go
+Content: 
+package utils
+
+import (
+	"fmt"
+	"math"
+	"strconv"
+)
+
+const (
+	defaultSize = 10
+)
+
+// Pagination query params
+type Pagination struct {
+	Size    int    `json:"size,omitempty"`
+	Page    int    `json:"page,omitempty"`
+	OrderBy string `json:"orderBy,omitempty"`
+}
+
+func NewPaginationQuery(size int, page int) *Pagination {
+	return &Pagination{Size: size, Page: page}
+}
+
+// SetSize Set page size
+func (q *Pagination) SetSize(sizeQuery string) error {
+	if sizeQuery == "" {
+		q.Size = defaultSize
+		return nil
+	}
+	n, err := strconv.Atoi(sizeQuery)
+	if err != nil {
+		return err
+	}
+	q.Size = n
+
+	return nil
+}
+
+// SetPage Set page number
+func (q *Pagination) SetPage(pageQuery string) error {
+	if pageQuery == "" {
+		q.Size = 0
+		return nil
+	}
+	n, err := strconv.Atoi(pageQuery)
+	if err != nil {
+		return err
+	}
+	q.Page = n
+
+	return nil
+}
+
+// SetOrderBy Set order by
+func (q *Pagination) SetOrderBy(orderByQuery string) {
+	q.OrderBy = orderByQuery
+}
+
+// GetOffset Get offset
+func (q *Pagination) GetOffset() int {
+	if q.Page == 0 {
+		return 0
+	}
+	return (q.Page - 1) * q.Size
+}
+
+// GetLimit Get limit
+func (q *Pagination) GetLimit() int {
+	return q.Size
+}
+
+// GetOrderBy Get OrderBy
+func (q *Pagination) GetOrderBy() string {
+	return q.OrderBy
+}
+
+// GetPage Get OrderBy
+func (q *Pagination) GetPage() int {
+	return q.Page
+}
+
+// GetSize Get OrderBy
+func (q *Pagination) GetSize() int {
+	return q.Size
+}
+
+// GetQueryString get query string
+func (q *Pagination) GetQueryString() string {
+	return fmt.Sprintf("page=%v&size=%v&orderBy=%s", q.GetPage(), q.GetSize(), q.GetOrderBy())
+}
+
+// GetTotalPages Get total pages int
+func (q *Pagination) GetTotalPages(totalCount int) int {
+	// d := float64(totalCount) / float64(pageSize)
+	d := float64(totalCount) / float64(q.GetSize())
+	return int(math.Ceil(d))
+}
+
+// GetHasMore Get has more
+func (q *Pagination) GetHasMore(totalCount int) bool {
+	return q.GetPage() < totalCount/q.GetSize()
+}
+
+
+File: 
+proto\product\product.pb.go
+Content: 
+// Code generated by protoc-gen-go. DO NOT EDIT.
+// versions:
+// 	protoc-gen-go v1.25.0
+// 	protoc        v3.14.0
+// source: product.proto
+
+//protoc --go_out=plugins=grpc:. *.proto
+
+package productsService
+
+import (
+	context "context"
+	proto "github.com/golang/protobuf/proto"
+	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	reflect "reflect"
+	sync "sync"
+)
+
+const (
+	// Verify that this generated code is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+	// Verify that runtime/protoimpl is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+)
+
+// This is a compile-time assertion that a sufficiently up-to-date version
+// of the legacy proto package is being used.
+const _ = proto.ProtoPackageIsVersion4
+
+type Product struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	ProductID   string                 `protobuf:"bytes,1,opt,name=ProductID,proto3" json:"ProductID,omitempty"`
+	CategoryID  string                 `protobuf:"bytes,2,opt,name=CategoryID,proto3" json:"CategoryID,omitempty"`
+	Name        string                 `protobuf:"bytes,3,opt,name=Name,proto3" json:"Name,omitempty"`
+	Description string                 `protobuf:"bytes,4,opt,name=Description,proto3" json:"Description,omitempty"`
+	Price       float64                `protobuf:"fixed64,5,opt,name=Price,proto3" json:"Price,omitempty"`
+	ImageURL    string                 `protobuf:"bytes,6,opt,name=ImageURL,proto3" json:"ImageURL,omitempty"`
+	Photos      []string               `protobuf:"bytes,7,rep,name=Photos,proto3" json:"Photos,omitempty"`
+	Quantity    int64                  `protobuf:"varint,8,opt,name=Quantity,proto3" json:"Quantity,omitempty"`
+	Rating      int64                  `protobuf:"varint,9,opt,name=Rating,proto3" json:"Rating,omitempty"`
+	CreatedAt   *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=CreatedAt,proto3" json:"CreatedAt,omitempty"`
+	UpdatedAt   *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=UpdatedAt,proto3" json:"UpdatedAt,omitempty"`
+}
+
+func (x *Product) Reset() {
+	*x = Product{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[0]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *Product) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Product) ProtoMessage() {}
+
+func (x *Product) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[0]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Product.ProtoReflect.Descriptor instead.
+func (*Product) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *Product) GetProductID() string {
+	if x != nil {
+		return x.ProductID
+	}
+	return ""
+}
+
+func (x *Product) GetCategoryID() string {
+	if x != nil {
+		return x.CategoryID
+	}
+	return ""
+}
+
+func (x *Product) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Product) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *Product) GetPrice() float64 {
+	if x != nil {
+		return x.Price
+	}
+	return 0
+}
+
+func (x *Product) GetImageURL() string {
+	if x != nil {
+		return x.ImageURL
+	}
+	return ""
+}
+
+func (x *Product) GetPhotos() []string {
+	if x != nil {
+		return x.Photos
+	}
+	return nil
+}
+
+func (x *Product) GetQuantity() int64 {
+	if x != nil {
+		return x.Quantity
+	}
+	return 0
+}
+
+func (x *Product) GetRating() int64 {
+	if x != nil {
+		return x.Rating
+	}
+	return 0
+}
+
+func (x *Product) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+func (x *Product) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return nil
+}
+
+type Empty struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+}
+
+func (x *Empty) Reset() {
+	*x = Empty{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[1]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *Empty) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Empty) ProtoMessage() {}
+
+func (x *Empty) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[1]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Empty.ProtoReflect.Descriptor instead.
+func (*Empty) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{1}
+}
+
+type CreateReq struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	CategoryID  string   `protobuf:"bytes,1,opt,name=CategoryID,proto3" json:"CategoryID,omitempty"`
+	Name        string   `protobuf:"bytes,2,opt,name=Name,proto3" json:"Name,omitempty"`
+	Description string   `protobuf:"bytes,3,opt,name=Description,proto3" json:"Description,omitempty"`
+	Price       float64  `protobuf:"fixed64,4,opt,name=Price,proto3" json:"Price,omitempty"`
+	ImageURL    string   `protobuf:"bytes,5,opt,name=ImageURL,proto3" json:"ImageURL,omitempty"`
+	Photos      []string `protobuf:"bytes,6,rep,name=Photos,proto3" json:"Photos,omitempty"`
+	Quantity    int64    `protobuf:"varint,7,opt,name=Quantity,proto3" json:"Quantity,omitempty"`
+	Rating      int64    `protobuf:"varint,8,opt,name=Rating,proto3" json:"Rating,omitempty"`
+}
+
+func (x *CreateReq) Reset() {
+	*x = CreateReq{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[2]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CreateReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateReq) ProtoMessage() {}
+
+func (x *CreateReq) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[2]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateReq.ProtoReflect.Descriptor instead.
+func (*CreateReq) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *CreateReq) GetCategoryID() string {
+	if x != nil {
+		return x.CategoryID
+	}
+	return ""
+}
+
+func (x *CreateReq) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *CreateReq) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *CreateReq) GetPrice() float64 {
+	if x != nil {
+		return x.Price
+	}
+	return 0
+}
+
+func (x *CreateReq) GetImageURL() string {
+	if x != nil {
+		return x.ImageURL
+	}
+	return ""
+}
+
+func (x *CreateReq) GetPhotos() []string {
+	if x != nil {
+		return x.Photos
+	}
+	return nil
+}
+
+func (x *CreateReq) GetQuantity() int64 {
+	if x != nil {
+		return x.Quantity
+	}
+	return 0
+}
+
+func (x *CreateReq) GetRating() int64 {
+	if x != nil {
+		return x.Rating
+	}
+	return 0
+}
+
+type CreateRes struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Product *Product `protobuf:"bytes,1,opt,name=Product,proto3" json:"Product,omitempty"`
+}
+
+func (x *CreateRes) Reset() {
+	*x = CreateRes{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[3]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *CreateRes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateRes) ProtoMessage() {}
+
+func (x *CreateRes) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[3]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateRes.ProtoReflect.Descriptor instead.
+func (*CreateRes) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CreateRes) GetProduct() *Product {
+	if x != nil {
+		return x.Product
+	}
+	return nil
+}
+
+type UpdateReq struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	ProductID   string   `protobuf:"bytes,1,opt,name=ProductID,proto3" json:"ProductID,omitempty"`
+	CategoryID  string   `protobuf:"bytes,2,opt,name=CategoryID,proto3" json:"CategoryID,omitempty"`
+	Name        string   `protobuf:"bytes,3,opt,name=Name,proto3" json:"Name,omitempty"`
+	Description string   `protobuf:"bytes,4,opt,name=Description,proto3" json:"Description,omitempty"`
+	Price       float64  `protobuf:"fixed64,5,opt,name=Price,proto3" json:"Price,omitempty"`
+	ImageURL    string   `protobuf:"bytes,6,opt,name=ImageURL,proto3" json:"ImageURL,omitempty"`
+	Photos      []string `protobuf:"bytes,7,rep,name=Photos,proto3" json:"Photos,omitempty"`
+	Quantity    int64    `protobuf:"varint,8,opt,name=Quantity,proto3" json:"Quantity,omitempty"`
+	Rating      int64    `protobuf:"varint,9,opt,name=Rating,proto3" json:"Rating,omitempty"`
+}
+
+func (x *UpdateReq) Reset() {
+	*x = UpdateReq{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[4]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *UpdateReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateReq) ProtoMessage() {}
+
+func (x *UpdateReq) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[4]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateReq.ProtoReflect.Descriptor instead.
+func (*UpdateReq) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *UpdateReq) GetProductID() string {
+	if x != nil {
+		return x.ProductID
+	}
+	return ""
+}
+
+func (x *UpdateReq) GetCategoryID() string {
+	if x != nil {
+		return x.CategoryID
+	}
+	return ""
+}
+
+func (x *UpdateReq) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *UpdateReq) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *UpdateReq) GetPrice() float64 {
+	if x != nil {
+		return x.Price
+	}
+	return 0
+}
+
+func (x *UpdateReq) GetImageURL() string {
+	if x != nil {
+		return x.ImageURL
+	}
+	return ""
+}
+
+func (x *UpdateReq) GetPhotos() []string {
+	if x != nil {
+		return x.Photos
+	}
+	return nil
+}
+
+func (x *UpdateReq) GetQuantity() int64 {
+	if x != nil {
+		return x.Quantity
+	}
+	return 0
+}
+
+func (x *UpdateReq) GetRating() int64 {
+	if x != nil {
+		return x.Rating
+	}
+	return 0
+}
+
+type UpdateRes struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Product *Product `protobuf:"bytes,1,opt,name=Product,proto3" json:"Product,omitempty"`
+}
+
+func (x *UpdateRes) Reset() {
+	*x = UpdateRes{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[5]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *UpdateRes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateRes) ProtoMessage() {}
+
+func (x *UpdateRes) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[5]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateRes.ProtoReflect.Descriptor instead.
+func (*UpdateRes) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *UpdateRes) GetProduct() *Product {
+	if x != nil {
+		return x.Product
+	}
+	return nil
+}
+
+type GetByIDReq struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	ProductID string `protobuf:"bytes,1,opt,name=ProductID,proto3" json:"ProductID,omitempty"`
+}
+
+func (x *GetByIDReq) Reset() {
+	*x = GetByIDReq{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[6]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetByIDReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetByIDReq) ProtoMessage() {}
+
+func (x *GetByIDReq) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[6]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetByIDReq.ProtoReflect.Descriptor instead.
+func (*GetByIDReq) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetByIDReq) GetProductID() string {
+	if x != nil {
+		return x.ProductID
+	}
+	return ""
+}
+
+type GetByIDRes struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Product *Product `protobuf:"bytes,1,opt,name=Product,proto3" json:"Product,omitempty"`
+}
+
+func (x *GetByIDRes) Reset() {
+	*x = GetByIDRes{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[7]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetByIDRes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetByIDRes) ProtoMessage() {}
+
+func (x *GetByIDRes) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[7]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetByIDRes.ProtoReflect.Descriptor instead.
+func (*GetByIDRes) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetByIDRes) GetProduct() *Product {
+	if x != nil {
+		return x.Product
+	}
+	return nil
+}
+
+type SearchReq struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Search string `protobuf:"bytes,1,opt,name=Search,proto3" json:"Search,omitempty"`
+	Page   int64  `protobuf:"varint,2,opt,name=page,proto3" json:"page,omitempty"`
+	Size   int64  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+}
+
+func (x *SearchReq) Reset() {
+	*x = SearchReq{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[8]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *SearchReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchReq) ProtoMessage() {}
+
+func (x *SearchReq) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[8]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchReq.ProtoReflect.Descriptor instead.
+func (*SearchReq) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *SearchReq) GetSearch() string {
+	if x != nil {
+		return x.Search
+	}
+	return ""
+}
+
+func (x *SearchReq) GetPage() int64 {
+	if x != nil {
+		return x.Page
+	}
+	return 0
+}
+
+func (x *SearchReq) GetSize() int64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+type SearchRes struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	TotalCount int64      `protobuf:"varint,1,opt,name=TotalCount,proto3" json:"TotalCount,omitempty"`
+	TotalPages int64      `protobuf:"varint,2,opt,name=TotalPages,proto3" json:"TotalPages,omitempty"`
+	Page       int64      `protobuf:"varint,3,opt,name=Page,proto3" json:"Page,omitempty"`
+	Size       int64      `protobuf:"varint,4,opt,name=Size,proto3" json:"Size,omitempty"`
+	HasMore    bool       `protobuf:"varint,5,opt,name=HasMore,proto3" json:"HasMore,omitempty"`
+	Products   []*Product `protobuf:"bytes,6,rep,name=Products,proto3" json:"Products,omitempty"`
+}
+
+func (x *SearchRes) Reset() {
+	*x = SearchRes{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_product_proto_msgTypes[9]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *SearchRes) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchRes) ProtoMessage() {}
+
+func (x *SearchRes) ProtoReflect() protoreflect.Message {
+	mi := &file_product_proto_msgTypes[9]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchRes.ProtoReflect.Descriptor instead.
+func (*SearchRes) Descriptor() ([]byte, []int) {
+	return file_product_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *SearchRes) GetTotalCount() int64 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+func (x *SearchRes) GetTotalPages() int64 {
+	if x != nil {
+		return x.TotalPages
+	}
+	return 0
+}
+
+func (x *SearchRes) GetPage() int64 {
+	if x != nil {
+		return x.Page
+	}
+	return 0
+}
+
+func (x *SearchRes) GetSize() int64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *SearchRes) GetHasMore() bool {
+	if x != nil {
+		return x.HasMore
+	}
+	return false
+}
+
+func (x *SearchRes) GetProducts() []*Product {
+	if x != nil {
+		return x.Products
+	}
+	return nil
+}
+
+var File_product_proto protoreflect.FileDescriptor
+
+var file_product_proto_rawDesc = []byte{
+	0x0a, 0x0d, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12,
+	0x0f, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65,
+	0x1a, 0x1f, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75,
+	0x66, 0x2f, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x2e, 0x70, 0x72, 0x6f, 0x74,
+	0x6f, 0x22, 0xef, 0x02, 0x0a, 0x07, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x12, 0x1c, 0x0a,
+	0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x12, 0x1e, 0x0a, 0x0a, 0x43,
+	0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
+	0x0a, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x12, 0x12, 0x0a, 0x04, 0x4e,
+	0x61, 0x6d, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x4e, 0x61, 0x6d, 0x65, 0x12,
+	0x20, 0x0a, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x04,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f,
+	0x6e, 0x12, 0x14, 0x0a, 0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x01,
+	0x52, 0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65,
+	0x55, 0x52, 0x4c, 0x18, 0x06, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65,
+	0x55, 0x52, 0x4c, 0x12, 0x16, 0x0a, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x18, 0x07, 0x20,
+	0x03, 0x28, 0x09, 0x52, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x12, 0x1a, 0x0a, 0x08, 0x51,
+	0x75, 0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x18, 0x08, 0x20, 0x01, 0x28, 0x03, 0x52, 0x08, 0x51,
+	0x75, 0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x12, 0x16, 0x0a, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e,
+	0x67, 0x18, 0x09, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e, 0x67, 0x12,
+	0x38, 0x0a, 0x09, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x18, 0x0a, 0x20, 0x01,
+	0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x70, 0x72, 0x6f, 0x74,
+	0x6f, 0x62, 0x75, 0x66, 0x2e, 0x54, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x52, 0x09,
+	0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x12, 0x38, 0x0a, 0x09, 0x55, 0x70, 0x64,
+	0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x18, 0x0b, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x67,
+	0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x2e, 0x54,
+	0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x52, 0x09, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65,
+	0x64, 0x41, 0x74, 0x22, 0x07, 0x0a, 0x05, 0x45, 0x6d, 0x70, 0x74, 0x79, 0x22, 0xdf, 0x01, 0x0a,
+	0x09, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x52, 0x65, 0x71, 0x12, 0x1e, 0x0a, 0x0a, 0x43, 0x61,
+	0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a,
+	0x43, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x12, 0x12, 0x0a, 0x04, 0x4e, 0x61,
+	0x6d, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x4e, 0x61, 0x6d, 0x65, 0x12, 0x20,
+	0x0a, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x03, 0x20,
+	0x01, 0x28, 0x09, 0x52, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f, 0x6e,
+	0x12, 0x14, 0x0a, 0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x01, 0x52,
+	0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65, 0x55,
+	0x52, 0x4c, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65, 0x55,
+	0x52, 0x4c, 0x12, 0x16, 0x0a, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x18, 0x06, 0x20, 0x03,
+	0x28, 0x09, 0x52, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x12, 0x1a, 0x0a, 0x08, 0x51, 0x75,
+	0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x18, 0x07, 0x20, 0x01, 0x28, 0x03, 0x52, 0x08, 0x51, 0x75,
+	0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x12, 0x16, 0x0a, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e, 0x67,
+	0x18, 0x08, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e, 0x67, 0x22, 0x3f,
+	0x0a, 0x09, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x52, 0x65, 0x73, 0x12, 0x32, 0x0a, 0x07, 0x50,
+	0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x18, 0x2e, 0x70,
+	0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x50,
+	0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x52, 0x07, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x22,
+	0xfd, 0x01, 0x0a, 0x09, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x52, 0x65, 0x71, 0x12, 0x1c, 0x0a,
+	0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x12, 0x1e, 0x0a, 0x0a, 0x43,
+	0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
+	0x0a, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x49, 0x44, 0x12, 0x12, 0x0a, 0x04, 0x4e,
+	0x61, 0x6d, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x4e, 0x61, 0x6d, 0x65, 0x12,
+	0x20, 0x0a, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x04,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x44, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x69, 0x6f,
+	0x6e, 0x12, 0x14, 0x0a, 0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x01,
+	0x52, 0x05, 0x50, 0x72, 0x69, 0x63, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65,
+	0x55, 0x52, 0x4c, 0x18, 0x06, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x49, 0x6d, 0x61, 0x67, 0x65,
+	0x55, 0x52, 0x4c, 0x12, 0x16, 0x0a, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x18, 0x07, 0x20,
+	0x03, 0x28, 0x09, 0x52, 0x06, 0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x12, 0x1a, 0x0a, 0x08, 0x51,
+	0x75, 0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x18, 0x08, 0x20, 0x01, 0x28, 0x03, 0x52, 0x08, 0x51,
+	0x75, 0x61, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x12, 0x16, 0x0a, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e,
+	0x67, 0x18, 0x09, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x52, 0x61, 0x74, 0x69, 0x6e, 0x67, 0x22,
+	0x3f, 0x0a, 0x09, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x52, 0x65, 0x73, 0x12, 0x32, 0x0a, 0x07,
+	0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x18, 0x2e,
+	0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e,
+	0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x52, 0x07, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74,
+	0x22, 0x2a, 0x0a, 0x0a, 0x47, 0x65, 0x74, 0x42, 0x79, 0x49, 0x44, 0x52, 0x65, 0x71, 0x12, 0x1c,
+	0x0a, 0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28,
+	0x09, 0x52, 0x09, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x49, 0x44, 0x22, 0x40, 0x0a, 0x0a,
+	0x47, 0x65, 0x74, 0x42, 0x79, 0x49, 0x44, 0x52, 0x65, 0x73, 0x12, 0x32, 0x0a, 0x07, 0x50, 0x72,
+	0x6f, 0x64, 0x75, 0x63, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x18, 0x2e, 0x70, 0x72,
+	0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x50, 0x72,
+	0x6f, 0x64, 0x75, 0x63, 0x74, 0x52, 0x07, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x22, 0x4b,
+	0x0a, 0x09, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x52, 0x65, 0x71, 0x12, 0x16, 0x0a, 0x06, 0x53,
+	0x65, 0x61, 0x72, 0x63, 0x68, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x53, 0x65, 0x61,
+	0x72, 0x63, 0x68, 0x12, 0x12, 0x0a, 0x04, 0x70, 0x61, 0x67, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28,
+	0x03, 0x52, 0x04, 0x70, 0x61, 0x67, 0x65, 0x12, 0x12, 0x0a, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x18,
+	0x03, 0x20, 0x01, 0x28, 0x03, 0x52, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x22, 0xc3, 0x01, 0x0a, 0x09,
+	0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x52, 0x65, 0x73, 0x12, 0x1e, 0x0a, 0x0a, 0x54, 0x6f, 0x74,
+	0x61, 0x6c, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0a, 0x54,
+	0x6f, 0x74, 0x61, 0x6c, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x12, 0x1e, 0x0a, 0x0a, 0x54, 0x6f, 0x74,
+	0x61, 0x6c, 0x50, 0x61, 0x67, 0x65, 0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0a, 0x54,
+	0x6f, 0x74, 0x61, 0x6c, 0x50, 0x61, 0x67, 0x65, 0x73, 0x12, 0x12, 0x0a, 0x04, 0x50, 0x61, 0x67,
+	0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x03, 0x52, 0x04, 0x50, 0x61, 0x67, 0x65, 0x12, 0x12, 0x0a,
+	0x04, 0x53, 0x69, 0x7a, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x03, 0x52, 0x04, 0x53, 0x69, 0x7a,
+	0x65, 0x12, 0x18, 0x0a, 0x07, 0x48, 0x61, 0x73, 0x4d, 0x6f, 0x72, 0x65, 0x18, 0x05, 0x20, 0x01,
+	0x28, 0x08, 0x52, 0x07, 0x48, 0x61, 0x73, 0x4d, 0x6f, 0x72, 0x65, 0x12, 0x34, 0x0a, 0x08, 0x50,
+	0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x18, 0x06, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x18, 0x2e,
+	0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e,
+	0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x52, 0x08, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74,
+	0x73, 0x32, 0xa4, 0x02, 0x0a, 0x0f, 0x50, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65,
+	0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x42, 0x0a, 0x06, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x12,
+	0x1a, 0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63,
+	0x65, 0x2e, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x52, 0x65, 0x71, 0x1a, 0x1a, 0x2e, 0x70, 0x72,
+	0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x43, 0x72,
+	0x65, 0x61, 0x74, 0x65, 0x52, 0x65, 0x73, 0x22, 0x00, 0x12, 0x42, 0x0a, 0x06, 0x55, 0x70, 0x64,
+	0x61, 0x74, 0x65, 0x12, 0x1a, 0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65,
+	0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x52, 0x65, 0x71, 0x1a,
+	0x1a, 0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63,
+	0x65, 0x2e, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x52, 0x65, 0x73, 0x22, 0x00, 0x12, 0x45, 0x0a,
+	0x07, 0x47, 0x65, 0x74, 0x42, 0x79, 0x49, 0x44, 0x12, 0x1b, 0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75,
+	0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x47, 0x65, 0x74, 0x42, 0x79,
+	0x49, 0x44, 0x52, 0x65, 0x71, 0x1a, 0x1b, 0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73,
+	0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x47, 0x65, 0x74, 0x42, 0x79, 0x49, 0x44, 0x52,
+	0x65, 0x73, 0x22, 0x00, 0x12, 0x42, 0x0a, 0x06, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x12, 0x1a,
+	0x2e, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65,
+	0x2e, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x52, 0x65, 0x71, 0x1a, 0x1a, 0x2e, 0x70, 0x72, 0x6f,
+	0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x53, 0x65, 0x61,
+	0x72, 0x63, 0x68, 0x52, 0x65, 0x73, 0x22, 0x00, 0x42, 0x13, 0x5a, 0x11, 0x2e, 0x3b, 0x70, 0x72,
+	0x6f, 0x64, 0x75, 0x63, 0x74, 0x73, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x62, 0x06, 0x70,
+	0x72, 0x6f, 0x74, 0x6f, 0x33,
+}
+
+var (
+	file_product_proto_rawDescOnce sync.Once
+	file_product_proto_rawDescData = file_product_proto_rawDesc
+)
+
+func file_product_proto_rawDescGZIP() []byte {
+	file_product_proto_rawDescOnce.Do(func() {
+		file_product_proto_rawDescData = protoimpl.X.CompressGZIP(file_product_proto_rawDescData)
+	})
+	return file_product_proto_rawDescData
+}
+
+var file_product_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_product_proto_goTypes = []interface{}{
+	(*Product)(nil),               // 0: productsService.Product
+	(*Empty)(nil),                 // 1: productsService.Empty
+	(*CreateReq)(nil),             // 2: productsService.CreateReq
+	(*CreateRes)(nil),             // 3: productsService.CreateRes
+	(*UpdateReq)(nil),             // 4: productsService.UpdateReq
+	(*UpdateRes)(nil),             // 5: productsService.UpdateRes
+	(*GetByIDReq)(nil),            // 6: productsService.GetByIDReq
+	(*GetByIDRes)(nil),            // 7: productsService.GetByIDRes
+	(*SearchReq)(nil),             // 8: productsService.SearchReq
+	(*SearchRes)(nil),             // 9: productsService.SearchRes
+	(*timestamppb.Timestamp)(nil), // 10: google.protobuf.Timestamp
+}
+var file_product_proto_depIdxs = []int32{
+	10, // 0: productsService.Product.CreatedAt:type_name -> google.protobuf.Timestamp
+	10, // 1: productsService.Product.UpdatedAt:type_name -> google.protobuf.Timestamp
+	0,  // 2: productsService.CreateRes.Product:type_name -> productsService.Product
+	0,  // 3: productsService.UpdateRes.Product:type_name -> productsService.Product
+	0,  // 4: productsService.GetByIDRes.Product:type_name -> productsService.Product
+	0,  // 5: productsService.SearchRes.Products:type_name -> productsService.Product
+	2,  // 6: productsService.ProductsService.Create:input_type -> productsService.CreateReq
+	4,  // 7: productsService.ProductsService.Update:input_type -> productsService.UpdateReq
+	6,  // 8: productsService.ProductsService.GetByID:input_type -> productsService.GetByIDReq
+	8,  // 9: productsService.ProductsService.Search:input_type -> productsService.SearchReq
+	3,  // 10: productsService.ProductsService.Create:output_type -> productsService.CreateRes
+	5,  // 11: productsService.ProductsService.Update:output_type -> productsService.UpdateRes
+	7,  // 12: productsService.ProductsService.GetByID:output_type -> productsService.GetByIDRes
+	9,  // 13: productsService.ProductsService.Search:output_type -> productsService.SearchRes
+	10, // [10:14] is the sub-list for method output_type
+	6,  // [6:10] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
+}
+
+func init() { file_product_proto_init() }
+func file_product_proto_init() {
+	if File_product_proto != nil {
+		return
+	}
+	if !protoimpl.UnsafeEnabled {
+		file_product_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*Product); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*Empty); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*CreateReq); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*CreateRes); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*UpdateReq); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*UpdateRes); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*GetByIDReq); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*GetByIDRes); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*SearchReq); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_product_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*SearchRes); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: file_product_proto_rawDesc,
+			NumEnums:      0,
+			NumMessages:   10,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_product_proto_goTypes,
+		DependencyIndexes: file_product_proto_depIdxs,
+		MessageInfos:      file_product_proto_msgTypes,
+	}.Build()
+	File_product_proto = out.File
+	file_product_proto_rawDesc = nil
+	file_product_proto_goTypes = nil
+	file_product_proto_depIdxs = nil
+}
+
+// Reference imports to suppress errors if they are not otherwise used.
+var _ context.Context
+var _ grpc.ClientConnInterface
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the grpc package it is being compiled against.
+const _ = grpc.SupportPackageIsVersion6
+
+// ProductsServiceClient is the client API for ProductsService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
+type ProductsServiceClient interface {
+	Create(ctx context.Context, in *CreateReq, opts ...grpc.CallOption) (*CreateRes, error)
+	Update(ctx context.Context, in *UpdateReq, opts ...grpc.CallOption) (*UpdateRes, error)
+	GetByID(ctx context.Context, in *GetByIDReq, opts ...grpc.CallOption) (*GetByIDRes, error)
+	Search(ctx context.Context, in *SearchReq, opts ...grpc.CallOption) (*SearchRes, error)
+}
+
+type productsServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewProductsServiceClient(cc grpc.ClientConnInterface) ProductsServiceClient {
+	return &productsServiceClient{cc}
+}
+
+func (c *productsServiceClient) Create(ctx context.Context, in *CreateReq, opts ...grpc.CallOption) (*CreateRes, error) {
+	out := new(CreateRes)
+	err := c.cc.Invoke(ctx, "/productsService.ProductsService/Create", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *productsServiceClient) Update(ctx context.Context, in *UpdateReq, opts ...grpc.CallOption) (*UpdateRes, error) {
+	out := new(UpdateRes)
+	err := c.cc.Invoke(ctx, "/productsService.ProductsService/Update", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *productsServiceClient) GetByID(ctx context.Context, in *GetByIDReq, opts ...grpc.CallOption) (*GetByIDRes, error) {
+	out := new(GetByIDRes)
+	err := c.cc.Invoke(ctx, "/productsService.ProductsService/GetByID", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *productsServiceClient) Search(ctx context.Context, in *SearchReq, opts ...grpc.CallOption) (*SearchRes, error) {
+	out := new(SearchRes)
+	err := c.cc.Invoke(ctx, "/productsService.ProductsService/Search", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ProductsServiceServer is the server API for ProductsService service.
+type ProductsServiceServer interface {
+	Create(context.Context, *CreateReq) (*CreateRes, error)
+	Update(context.Context, *UpdateReq) (*UpdateRes, error)
+	GetByID(context.Context, *GetByIDReq) (*GetByIDRes, error)
+	Search(context.Context, *SearchReq) (*SearchRes, error)
+}
+
+// UnimplementedProductsServiceServer can be embedded to have forward compatible implementations.
+type UnimplementedProductsServiceServer struct {
+}
+
+func (*UnimplementedProductsServiceServer) Create(context.Context, *CreateReq) (*CreateRes, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Create not implemented")
+}
+func (*UnimplementedProductsServiceServer) Update(context.Context, *UpdateReq) (*UpdateRes, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Update not implemented")
+}
+func (*UnimplementedProductsServiceServer) GetByID(context.Context, *GetByIDReq) (*GetByIDRes, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetByID not implemented")
+}
+func (*UnimplementedProductsServiceServer) Search(context.Context, *SearchReq) (*SearchRes, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Search not implemented")
+}
+
+func RegisterProductsServiceServer(s *grpc.Server, srv ProductsServiceServer) {
+	s.RegisterService(&_ProductsService_serviceDesc, srv)
+}
+
+func _ProductsService_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductsServiceServer).Create(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/productsService.ProductsService/Create",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductsServiceServer).Create(ctx, req.(*CreateReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProductsService_Update_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductsServiceServer).Update(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/productsService.ProductsService/Update",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductsServiceServer).Update(ctx, req.(*UpdateReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProductsService_GetByID_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetByIDReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductsServiceServer).GetByID(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/productsService.ProductsService/GetByID",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductsServiceServer).GetByID(ctx, req.(*GetByIDReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProductsService_Search_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductsServiceServer).Search(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/productsService.ProductsService/Search",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductsServiceServer).Search(ctx, req.(*SearchReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+var _ProductsService_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "productsService.ProductsService",
+	HandlerType: (*ProductsServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Create",
+			Handler:    _ProductsService_Create_Handler,
+		},
+		{
+			MethodName: "Update",
+			Handler:    _ProductsService_Update_Handler,
+		},
+		{
+			MethodName: "GetByID",
+			Handler:    _ProductsService_GetByID_Handler,
+		},
+		{
+			MethodName: "Search",
+			Handler:    _ProductsService_Search_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "product.proto",
+}
+
+
+File: 
+proto\product\product.proto
+Content: 
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+//protoc --go_out=plugins=grpc:. *.proto
+
+package productsService;
+option go_package = ".;productsService";
+
+message Product {
+  string ProductID = 1;
+  string CategoryID = 2;
+  string Name = 3;
+  string Description = 4;
+  double Price = 5;
+  string ImageURL = 6;
+  repeated string Photos = 7;
+  int64 Quantity = 8;
+  int64 Rating = 9;
+  google.protobuf.Timestamp CreatedAt = 10;
+  google.protobuf.Timestamp UpdatedAt = 11;
+}
+
+message Empty {}
+
+message CreateReq {
+  string CategoryID = 1;
+  string Name = 2;
+  string Description = 3;
+  double Price = 4;
+  string ImageURL = 5;
+  repeated string Photos = 6;
+  int64 Quantity = 7;
+  int64 Rating = 8;
+}
+
+message CreateRes {
+  Product Product = 1;
+}
+
+message UpdateReq {
+  string ProductID = 1;
+  string CategoryID = 2;
+  string Name = 3;
+  string Description = 4;
+  double Price = 5;
+  string ImageURL = 6;
+  repeated string Photos = 7;
+  int64 Quantity = 8;
+  int64 Rating = 9;
+}
+
+message UpdateRes {
+  Product Product = 1;
+}
+
+message GetByIDReq {
+  string ProductID = 1;
+}
+
+message GetByIDRes {
+  Product Product = 1;
+}
+
+message SearchReq {
+  string Search = 1;
+  int64 page = 2;
+  int64 size = 3;
+}
+
+message SearchRes {
+  int64 TotalCount = 1;
+  int64 TotalPages = 2;
+  int64 Page = 3;
+  int64 Size = 4;
+  bool HasMore = 5;
+  repeated Product Products = 6;
+}
+
+service ProductsService {
+  rpc Create(CreateReq) returns (CreateRes) {}
+  rpc Update(UpdateReq) returns (UpdateRes) {}
+  rpc GetByID(GetByIDReq) returns (GetByIDRes) {}
+  rpc Search(SearchReq) returns (SearchRes) {}
+}
+
+File: 
+scripts\init.js
+Content: 
+use products
+
+db.products.stats()
+
+db.products.createIndex({ name: 1, description: 1 });
+db.products.createIndex({ '$**': 'text' });
+
+db.products.getIndexes();
+
+File: 
+ssl\ca.key
+Content: 
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+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
+YkntYvM2iQ9n/DyMOx4QFg==
+-----END ENCRYPTED PRIVATE KEY-----
+
+
+File: 
+ssl\instructions.sh
+Content: 
+#!/bin/bash
+# Inspired from: https://github.com/grpc/grpc-java/tree/master/examples#generating-self-signed-certificates-for-use-with-grpc
+
+# Output files
+# ca.key: Certificate Authority private key file (this shouldn't be shared in real-life)
+# ca.crt: Certificate Authority trust certificate (this should be shared with users in real-life)
+# server.key: Server private key, password protected (this shouldn't be shared)
+# server.csr: Server certificate signing request (this should be shared with the CA owner)
+# server.crt: Server certificate signed by the CA (this would be sent back by the CA owner) - keep on server
+# server.pem: Conversion of server.key into a format grpc likes (this shouldn't be shared)
+
+# Summary
+# Private files: ca.key, server.key, server.pem, server.crt
+# "Share" files: ca.crt (needed by the client), server.csr (needed by the CA)
+
+# Changes these CN's to match your hosts in your environment if needed.
+SERVER_CN=localhost
+
+# Step 1: Generate Certificate Authority + Trust Certificate (ca.crt)
+openssl genrsa -passout pass:1111 -des3 -out ca.key 4096
+openssl req -passin pass:1111 -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=${SERVER_CN}"
+
+# Step 2: Generate the Server Private Key (server.key)
+openssl genrsa -passout pass:1111 -des3 -out server.key 4096
+
+# Step 3: Get a certificate signing request from the CA (server.csr)
+openssl req -passin pass:1111 -new -key server.key -out server.csr -subj "/CN=${SERVER_CN}"
+
+# Step 4: Sign the certificate with the CA we created (it's called self signing) - server.crt
+openssl x509 -req -passin pass:1111 -days 3650 -in server.csr -CA ca.crt -CAkey ca.key -set_serial 01 -out server.crt
+
+# Step 5: Convert the server certificate to .pem format (server.pem) - usable by grpc
+openssl pkcs8 -topk8 -nocrypt -passin pass:1111 -in server.key -out server.pem
+
+File: 
+ssl\server.key
+Content: 
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+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
+eDQCVzRChsEwYcg0BVvhQQ==
+-----END ENCRYPTED PRIVATE KEY-----
+
+
+File: 
+ssl\server.pem
+Content: 
+-----BEGIN PRIVATE KEY-----
+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
+aWhuxdOcFRMZ01dZKvPsnF4UeppUk/A=
+-----END PRIVATE KEY-----
+
+
